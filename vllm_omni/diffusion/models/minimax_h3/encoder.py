@@ -1428,14 +1428,22 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if next(self.parameters()).device.type != self.device_target.type:
             raise RuntimeError("call load_to_device() before encode_ids()")
 
+        # cuDNN SDP is a process-global flag; it must be restored before the
+        # encoder yields control, otherwise the video VAE's SDPA ``auto`` mode
+        # picks different backends on ranks that ran text encoding vs. ranks
+        # that skipped it, desynchronizing DP outputs.
+        prev_cudnn_sdp = torch.backends.cuda.cudnn_sdp_enabled()
         torch.backends.cuda.enable_cudnn_sdp(True)
-        hidden = self._encode(
-            input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
+        try:
+            hidden = self._encode(
+                input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+            )
+        finally:
+            torch.backends.cuda.enable_cudnn_sdp(prev_cudnn_sdp)
         return hidden.cpu()
 
     def forward(
