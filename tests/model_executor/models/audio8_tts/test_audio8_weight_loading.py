@@ -10,113 +10,40 @@ Asserts, against the real ``AutoArk-AI/Audio8-TTS-Preview-0.6b`` checkpoint:
      wqkv→qkv_proj / w1+w3→gate_up_proj remapping,
   4. unknown tensor names are rejected loudly.
 
-Skips when the checkpoint is not present in the local HF cache.
+Model construction lives in ``conftest.audio8_model`` (session-scoped).
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 import torch
-from safetensors.torch import load_file
 
-from vllm_omni.model_executor.models.audio8_tts.audio8_tts_ar import Audio8TTSAR
-from vllm_omni.model_executor.models.audio8_tts.configuration_audio8 import Audio8TTSConfig
+pytestmark = [pytest.mark.core_model]
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-MODEL_REPO = "AutoArk-AI/Audio8-TTS-Preview-0.6b"
 EXPECTED_TOTAL_PARAMS = 601_159_424
 EXPECTED_NUM_TENSORS = 226
 
 
-@pytest.fixture(scope="module")
-def model_dir():
-    try:
-        from huggingface_hub import snapshot_download
-
-        path = snapshot_download(
-            MODEL_REPO,
-            local_files_only=True,
-            allow_patterns=["config.json", "model.safetensors"],
-        )
-    except Exception as exc:  # pragma: no cover - depends on local cache
-        pytest.skip(f"Audio8 checkpoint not available in local HF cache: {exc}")
-    return path
-
-
-@pytest.fixture(scope="module")
-def built_model(model_dir):
-    """Build + load the AR model once per module.
-
-    vLLM's Attention registers layer names in a process-global registry, so a
-    model with engine attention layers can only be constructed once per
-    process (the engine does exactly that).  Fake the TP/PP groups here
-    instead of using the function-scoped ``init_fake_tp_group`` fixture.
-    """
-    from transformers import AutoConfig
-    from vllm.config import ModelConfig, VllmConfig
-    from vllm.distributed import parallel_state
-    from vllm.model_executor.models.registry import ModelRegistry
-
-    try:
-        AutoConfig.register("arktts", Audio8TTSConfig)
-    except ValueError:
-        pass  # already registered
-    # Same registration the engine performs for omni architectures (wired up
-    # properly in the model registry step); needed here so ModelConfig accepts
-    # the checkpoint's "ArkttsModel" architecture.
-    ModelRegistry.register_model(
-        "ArkttsModel",
-        "vllm_omni.model_executor.models.audio8_tts.audio8_tts_ar:Audio8TTSAR",
-    )
-
-    mock_tp = MagicMock()
-    mock_tp.world_size = 1
-    mock_tp.rank_in_group = 0
-    mock_pp = MagicMock()
-    mock_pp.world_size = 1
-    mock_pp.rank_in_group = 0
-    mock_pp.is_last_rank = True
-    mock_pp.is_first_rank = True
-    old_tp, old_pp = parallel_state._TP, parallel_state._PP
-    parallel_state._TP = mock_tp
-    parallel_state._PP = mock_pp
-    try:
-        model_config = ModelConfig(model=model_dir)
-        vllm_config = VllmConfig(model_config=model_config)
-        model = Audio8TTSAR(vllm_config=vllm_config).to(torch.bfloat16)
-        checkpoint = load_file(f"{model_dir}/model.safetensors")
-        model.load_weights(checkpoint.items())
-        model.eval()
-        yield model, checkpoint
-    finally:
-        parallel_state._TP = old_tp
-        parallel_state._PP = old_pp
-
-
-def test_all_checkpoint_tensors_consumed(built_model):
-    model, checkpoint = built_model
-    consumed = model.load_weights(checkpoint.items())
-    assert consumed == set(checkpoint.keys())
+def test_all_checkpoint_tensors_consumed(audio8_model, audio8_checkpoint):
+    consumed = audio8_model.load_weights(audio8_checkpoint.items())
+    assert consumed == set(audio8_checkpoint.keys())
     assert len(consumed) == EXPECTED_NUM_TENSORS
 
 
-def test_total_parameter_count(built_model):
-    model, _ = built_model
-    total = sum(p.numel() for p in model.parameters())
+def test_total_parameter_count(audio8_model):
+    total = sum(p.numel() for p in audio8_model.parameters())
     assert total == EXPECTED_TOTAL_PARAMS
 
 
-def test_weights_bitwise_equal(built_model):
-    model, ckpt = built_model
+def test_weights_bitwise_equal(audio8_model, audio8_checkpoint):
+    model, ckpt = audio8_model, audio8_checkpoint
 
     def check(ckpt_name: str, param: torch.Tensor):
         expected = ckpt[ckpt_name]
-        assert param.dtype == expected.dtype, ckpt_name
-        assert param.shape == expected.shape, ckpt_name
-        assert torch.equal(param, expected.to(param.dtype)), ckpt_name
+        actual = param.detach().cpu()
+        assert actual.dtype == expected.dtype, ckpt_name
+        assert actual.shape == expected.shape, ckpt_name
+        assert torch.equal(actual, expected.to(actual.dtype)), ckpt_name
 
     backbone = model.model
     check("embeddings.weight", backbone.embed_tokens.weight)
@@ -156,12 +83,11 @@ def test_weights_bitwise_equal(built_model):
     check("fast_output.weight", model.fast_output.weight)
 
 
-def test_rope_is_interleaved_and_bf16_truncated(built_model):
+def test_rope_is_interleaved_and_bf16_truncated(audio8_model):
     """Audio8 uses GPT-J style RoPE with a bf16 table, unlike stock Qwen2."""
     from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
-    model, _ = built_model
-    rotary = model.model.layers[0].self_attn.rotary_emb
+    rotary = audio8_model.model.layers[0].self_attn.rotary_emb
     assert isinstance(rotary, RotaryEmbedding)
     assert rotary.is_neox_style is False
     # cos_sin_cache round-trips through bf16, so it must equal its bf16 cast.
@@ -169,7 +95,6 @@ def test_rope_is_interleaved_and_bf16_truncated(built_model):
     assert torch.equal(cache, cache.to(torch.bfloat16).to(cache.dtype))
 
 
-def test_unknown_weight_name_rejected(built_model):
-    model, _ = built_model
+def test_unknown_weight_name_rejected(audio8_model):
     with pytest.raises(KeyError):
-        model.load_weights([("totally.bogus.weight", torch.zeros(1))])
+        audio8_model.load_weights([("totally.bogus.weight", torch.zeros(1))])
