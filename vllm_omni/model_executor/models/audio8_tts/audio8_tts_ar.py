@@ -1,15 +1,18 @@
 """Audio8 TTS dual-AR model (``ArkttsModel``) for vLLM-Omni.
 
-Slow AR (24-layer GQA transformer over text+semantic tokens) built from vLLM
-primitives so it runs on the engine's paged attention path; fast codebook head
-(:mod:`.audio8_tts_fast_ar`) runs side-band with its own fixed KV cache.
+The slow AR reuses vLLM's ``Qwen2Model`` as its backbone: Audio8's attention
+matches Qwen2 exactly (fused QKV with bias, o_proj without bias, no q/k norm,
+head_dim 64 via 896/14) except for the RoPE style, which is rebuilt as
+interleaved (GPT-J) in :meth:`Audio8TTSAR._fix_rope_style` -- the same
+approach Fish Speech uses on top of ``Qwen3Model``.
 
-Structure ported from the reference SGLang implementation
-(``Audio8_TTS/sglang_omni/.../sglang_model.py``); numerics anchored to the
-HF remote-code ``modeling_arktts.py``.
+The fast codebook head (:mod:`.audio8_tts_fast_ar`) runs side-band in pure
+torch with its own fixed KV cache.  Structure ported from the reference SGLang
+implementation; numerics anchored to the HF remote-code ``modeling_arktts.py``.
 
 Weight name mapping (slow AR):
-  ``embeddings.weight`` → ``embed_tokens.weight``
+  ``embeddings.weight`` → ``model.embed_tokens.weight``
+  ``norm.weight`` → ``model.norm.weight``
   ``attention.wqkv.{weight,bias}`` → ``self_attn.qkv_proj.{weight,bias}`` (q/k/v split)
   ``attention.wo.{weight,bias}`` → ``self_attn.o_proj.{weight,bias}``
   ``attention_norm`` → ``input_layernorm``, ``ffn_norm`` → ``post_attention_layernorm``
@@ -24,16 +27,12 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
-from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.qwen2 import Qwen2Model
+from vllm.model_executor.models.utils import maybe_prefix
 
 from .audio8_tts_fast_ar import (
     Audio8FastDecoderLayer,
@@ -41,94 +40,37 @@ from .audio8_tts_fast_ar import (
     build_fast_rope_table,
 )
 
+logger = init_logger(__name__)
+
 # Checkpoint-side names that are recomputed at runtime, never stored.
 _NON_PERSISTENT_WEIGHTS = {"freqs_cis", "fast_freqs_cis"}
 
-
-class Audio8Attention(nn.Module):
-    """Slow-AR self-attention on the engine's paged-attention path."""
-
-    def __init__(self, config: Any, layer_id: int, *, prefix: str = "") -> None:
-        super().__init__()
-        self.q_size = config.n_head * config.head_dim
-        self.kv_size = config.n_local_heads * config.head_dim
-        self.head_dim = config.head_dim
-        self.qkv_proj = QKVParallelLinear(
-            config.dim,
-            config.head_dim,
-            config.n_head,
-            config.n_local_heads,
-            bias=config.attention_qkv_bias,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            config.n_head * config.head_dim,
-            config.dim,
-            bias=config.attention_o_bias,
-            prefix=f"{prefix}.o_proj",
-        )
-        self.rotary_emb = get_rope(
-            config.head_dim,
-            max_position=config.max_seq_len,
-            is_neox_style=False,  # Audio8 uses interleaved (GPT-J) RoPE
-            rope_parameters={"rope_theta": config.rope_base, "rope_type": "default"},
-        )
-        self.attn = Attention(
-            config.n_head,
-            config.head_dim,
-            config.head_dim**-0.5,
-            num_kv_heads=config.n_local_heads,
-            prefix=f"{prefix}.attn",
-        )
-        self.qk_norm = config.attention_qk_norm
-        if self.qk_norm:
-            self.q_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
-            self.k_norm = RMSNorm(config.head_dim, eps=config.norm_eps)
-
-
-class Audio8DecoderLayer(nn.Module):
-    def __init__(self, config: Any, layer_id: int, *, prefix: str = "") -> None:
-        super().__init__()
-        self.self_attn = Audio8Attention(config, layer_id, prefix=f"{prefix}.self_attn")
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.dim,
-            [config.intermediate_size, config.intermediate_size],
-            bias=False,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.dim,
-            bias=False,
-            prefix=f"{prefix}.down_proj",
-        )
-        self.input_layernorm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.dim, eps=config.norm_eps)
+# The HF reference precomputes the RoPE table in bf16 (modeling_arktts.py
+# ``_precompute_rope``).  vLLM builds f32 cos/sin caches; truncating them to
+# bf16 and back keeps engine numerics aligned with the reference (same fix as
+# Fish Speech, without which greedy decode can diverge).
+_ROPE_CACHE_TRUNCATE_DTYPE = torch.bfloat16
 
 
 class Audio8TTSAR(nn.Module):
-    """Dual-AR Audio8 model: slow AR (paged attention) + fast codebook head."""
+    """Dual-AR Audio8 model: slow AR (Qwen2 backbone) + fast codebook head."""
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        self.vllm_config = vllm_config
+        config: Any = vllm_config.model_config.hf_config
         self.config = config
         self.vocab_size = int(config.vocab_size)
         self.hidden_size = int(config.dim)
         self.num_layers = int(config.n_layer)
         self.tie_word_embeddings = bool(config.tie_word_embeddings)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.dim,
-            prefix="embed_tokens",
-        )
+        self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self._fix_rope_style()
+
         # Multi-codebook conditioning table: code i of frame f contributes
         # codebook_embeddings(code + i * codebook_size).
         self.codebook_embeddings = nn.Embedding(config.codebook_size * config.num_codebooks, config.dim)
-        self.layers = nn.ModuleList(
-            Audio8DecoderLayer(config, idx, prefix=f"layers.{idx}") for idx in range(config.n_layer)
-        )
-        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
 
         # Fast codebook head. fast_project_in is Identity when dims match
         # (the 0.6b checkpoint has fast_dim == dim and no projection weights).
@@ -139,6 +81,28 @@ class Audio8TTSAR(nn.Module):
         self.fast_layers = nn.ModuleList(Audio8FastDecoderLayer(config) for _ in range(config.n_fast_layer))
         self.fast_norm = Audio8FastRMSNorm(config.fast_dim, config.norm_eps)
         self.fast_output = nn.Linear(config.fast_dim, config.codebook_size, bias=False)
+
+    @property
+    def embed_tokens(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def _fix_rope_style(self) -> None:
+        """Rebuild each layer's RoPE as interleaved (GPT-J) style.
+
+        Audio8 was trained with interleaved RoPE, but vLLM's Qwen2 attention
+        defaults to NeoX style.
+        """
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            attn.rotary_emb = get_rope(
+                head_size=attn.head_dim,
+                max_position=self.config.max_seq_len,
+                is_neox_style=False,
+                rope_parameters={
+                    "rope_theta": self.config.rope_base,
+                    "rope_type": "default",
+                },
+            )
 
     def build_fast_rope(self, device: torch.device) -> Tensor:
         return build_fast_rope_table(
@@ -156,17 +120,43 @@ class Audio8TTSAR(nn.Module):
             if name in _NON_PERSISTENT_WEIGHTS:
                 consumed.add(name)
                 continue
+            if name == "norm.weight":
+                self._load_direct("model.norm.weight", loaded_weight, params)
+                consumed.add(name)
+                continue
             if self._load_slow_weight(name, loaded_weight, params):
                 consumed.add(name)
                 continue
-            target_name = "embed_tokens.weight" if name == "embeddings.weight" else name
+            target_name = "model.embed_tokens.weight" if name == "embeddings.weight" else name
             target = params.get(target_name)
             if target is None:
                 raise KeyError(f"Unexpected Audio8 weight in checkpoint: {name}")
             loader = getattr(target, "weight_loader", default_weight_loader)
             loader(target, loaded_weight)
             consumed.add(name)
+
+        # Align RoPE cos/sin caches with the reference's bf16 table; see
+        # _ROPE_CACHE_TRUNCATE_DTYPE.
+        truncated = 0
+        for module in self.modules():
+            if hasattr(module, "cos_sin_cache") and isinstance(module.cos_sin_cache, torch.Tensor):
+                cache = module.cos_sin_cache
+                module.cos_sin_cache = cache.to(_ROPE_CACHE_TRUNCATE_DTYPE).to(cache.dtype)
+                truncated += 1
+        if truncated:
+            logger.debug("Truncated %d RoPE cos/sin caches to bf16", truncated)
+
         return consumed
+
+    def _load_direct(
+        self,
+        target_name: str,
+        loaded_weight: Tensor,
+        params: dict[str, nn.Parameter],
+    ) -> None:
+        parameter = params[target_name]
+        loader = getattr(parameter, "weight_loader", default_weight_loader)
+        loader(parameter, loaded_weight)
 
     def _load_slow_weight(
         self,
@@ -185,14 +175,14 @@ class Audio8TTSAR(nn.Module):
             "attention.k_norm.weight": "self_attn.k_norm.weight",
             "attention_norm.weight": "input_layernorm.weight",
             "ffn_norm.weight": "post_attention_layernorm.weight",
-            "feed_forward.w1.weight": ("gate_up_proj.weight", 0),
-            "feed_forward.w3.weight": ("gate_up_proj.weight", 1),
-            "feed_forward.w2.weight": "down_proj.weight",
+            "feed_forward.w1.weight": ("mlp.gate_up_proj.weight", 0),
+            "feed_forward.w3.weight": ("mlp.gate_up_proj.weight", 1),
+            "feed_forward.w2.weight": "mlp.down_proj.weight",
         }
         for source_suffix, target in remap.items():
             if not name.endswith(source_suffix):
                 continue
-            prefix = name[: -len(source_suffix)]
+            prefix = "model." + name[: -len(source_suffix)]
             if target is None:
                 self._load_fused_qkv(
                     prefix,
@@ -224,7 +214,7 @@ class Audio8TTSAR(nn.Module):
     ) -> None:
         target_name = prefix + "self_attn.qkv_proj." + ("bias" if is_bias else "weight")
         parameter = params[target_name]
-        layer = self.layers[int(prefix.split(".")[1])]
+        layer = self.model.layers[int(prefix.split(".")[2])]
         q, k, v = loaded_weight.split(
             [layer.self_attn.q_size, layer.self_attn.kv_size, layer.self_attn.kv_size],
             dim=0,

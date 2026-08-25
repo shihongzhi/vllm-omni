@@ -52,25 +52,48 @@ def built_model(model_dir):
 
     vLLM's Attention registers layer names in a process-global registry, so a
     model with engine attention layers can only be constructed once per
-    process (the engine does exactly that).  Fake the TP group here instead of
-    using the function-scoped ``init_fake_tp_group`` fixture.
+    process (the engine does exactly that).  Fake the TP/PP groups here
+    instead of using the function-scoped ``init_fake_tp_group`` fixture.
     """
+    from transformers import AutoConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.distributed import parallel_state
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    try:
+        AutoConfig.register("arktts", Audio8TTSConfig)
+    except ValueError:
+        pass  # already registered
+    # Same registration the engine performs for omni architectures (wired up
+    # properly in the model registry step); needed here so ModelConfig accepts
+    # the checkpoint's "ArkttsModel" architecture.
+    ModelRegistry.register_model(
+        "ArkttsModel",
+        "vllm_omni.model_executor.models.audio8_tts.audio8_tts_ar:Audio8TTSAR",
+    )
 
     mock_tp = MagicMock()
     mock_tp.world_size = 1
     mock_tp.rank_in_group = 0
-    old_tp = parallel_state._TP
+    mock_pp = MagicMock()
+    mock_pp.world_size = 1
+    mock_pp.rank_in_group = 0
+    mock_pp.is_last_rank = True
+    mock_pp.is_first_rank = True
+    old_tp, old_pp = parallel_state._TP, parallel_state._PP
     parallel_state._TP = mock_tp
+    parallel_state._PP = mock_pp
     try:
-        config = Audio8TTSConfig.from_pretrained(model_dir)
-        model = Audio8TTSAR(config).to(torch.bfloat16)
+        model_config = ModelConfig(model=model_dir)
+        vllm_config = VllmConfig(model_config=model_config)
+        model = Audio8TTSAR(vllm_config=vllm_config).to(torch.bfloat16)
         checkpoint = load_file(f"{model_dir}/model.safetensors")
         model.load_weights(checkpoint.items())
         model.eval()
         yield model, checkpoint
     finally:
         parallel_state._TP = old_tp
+        parallel_state._PP = old_pp
 
 
 def test_all_checkpoint_tensors_consumed(built_model):
@@ -95,29 +118,55 @@ def test_weights_bitwise_equal(built_model):
         assert param.shape == expected.shape, ckpt_name
         assert torch.equal(param, expected.to(param.dtype)), ckpt_name
 
-    check("embeddings.weight", model.embed_tokens.weight)
+    backbone = model.model
+    check("embeddings.weight", backbone.embed_tokens.weight)
+    check("norm.weight", backbone.norm.weight)
     check("codebook_embeddings.weight", model.codebook_embeddings.weight)
-    check("norm.weight", model.norm.weight)
 
     # Slow layer 0: fused QKV weight+bias reassembled from q/k/v shards.
-    check("layers.0.attention.wqkv.weight", model.layers[0].self_attn.qkv_proj.weight)
-    check("layers.0.attention.wqkv.bias", model.layers[0].self_attn.qkv_proj.bias)
-    check("layers.0.attention.wo.weight", model.layers[0].self_attn.o_proj.weight)
-    check("layers.11.attention_norm.weight", model.layers[11].input_layernorm.weight)
-    check("layers.11.ffn_norm.weight", model.layers[11].post_attention_layernorm.weight)
+    check("layers.0.attention.wqkv.weight", backbone.layers[0].self_attn.qkv_proj.weight)
+    check("layers.0.attention.wqkv.bias", backbone.layers[0].self_attn.qkv_proj.bias)
+    check("layers.0.attention.wo.weight", backbone.layers[0].self_attn.o_proj.weight)
+    check("layers.11.attention_norm.weight", backbone.layers[11].input_layernorm.weight)
+    check("layers.11.ffn_norm.weight", backbone.layers[11].post_attention_layernorm.weight)
 
     # Merged gate_up: gate (w1) is the first shard, up (w3) the second.
-    gate_up = model.layers[23].gate_up_proj.weight
-    check("layers.23.feed_forward.w1.weight", gate_up[: ckpt["layers.23.feed_forward.w1.weight"].shape[0]])
-    check("layers.23.feed_forward.w3.weight", gate_up[ckpt["layers.23.feed_forward.w1.weight"].shape[0] :])
-    check("layers.23.feed_forward.w2.weight", model.layers[23].down_proj.weight)
+    gate_up = backbone.layers[23].mlp.gate_up_proj.weight
+    check(
+        "layers.23.feed_forward.w1.weight",
+        gate_up[: ckpt["layers.23.feed_forward.w1.weight"].shape[0]],
+    )
+    check(
+        "layers.23.feed_forward.w3.weight",
+        gate_up[ckpt["layers.23.feed_forward.w1.weight"].shape[0] :],
+    )
+    check("layers.23.feed_forward.w2.weight", backbone.layers[23].mlp.down_proj.weight)
 
     # Fast head loads 1:1.
     check("fast_embeddings.weight", model.fast_embeddings.weight)
-    check("fast_layers.0.attention.wqkv.weight", model.fast_layers[0].attention.wqkv.weight)
-    check("fast_layers.3.feed_forward.w2.weight", model.fast_layers[3].feed_forward.w2.weight)
+    check(
+        "fast_layers.0.attention.wqkv.weight",
+        model.fast_layers[0].attention.wqkv.weight,
+    )
+    check(
+        "fast_layers.3.feed_forward.w2.weight",
+        model.fast_layers[3].feed_forward.w2.weight,
+    )
     check("fast_norm.weight", model.fast_norm.weight)
     check("fast_output.weight", model.fast_output.weight)
+
+
+def test_rope_is_interleaved_and_bf16_truncated(built_model):
+    """Audio8 uses GPT-J style RoPE with a bf16 table, unlike stock Qwen2."""
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    model, _ = built_model
+    rotary = model.model.layers[0].self_attn.rotary_emb
+    assert isinstance(rotary, RotaryEmbedding)
+    assert rotary.is_neox_style is False
+    # cos_sin_cache round-trips through bf16, so it must equal its bf16 cast.
+    cache = rotary.cos_sin_cache
+    assert torch.equal(cache, cache.to(torch.bfloat16).to(cache.dtype))
 
 
 def test_unknown_weight_name_rejected(built_model):
