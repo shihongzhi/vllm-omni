@@ -48,6 +48,9 @@ def fake_single_process_groups() -> tuple[MagicMock, MagicMock]:
     mock_tp = MagicMock()
     mock_tp.world_size = 1
     mock_tp.rank_in_group = 0
+    # Single-rank collectives are identity; without this VocabParallelEmbedding
+    # (which calls tensor_model_parallel_all_reduce unconditionally) returns Mocks.
+    mock_tp.all_reduce.side_effect = lambda t: t
     mock_pp = MagicMock()
     mock_pp.world_size = 1
     mock_pp.rank_in_group = 0
@@ -88,6 +91,10 @@ def audio8_model(audio8_model_dir):
         model.load_weights(checkpoint.items())
         del checkpoint
         model.eval()
+        # Inference-only tests: without this, params like the fast-head
+        # embedding keep requires_grad=True and every forward retains its
+        # autograd graph (GBs across the long decode loops) until OOM.
+        model.requires_grad_(False)
         if torch.cuda.is_available():
             model = model.to("cuda")
         yield model
@@ -263,6 +270,89 @@ class SlowARSDPARunner:
         self.v_cache.zero_()
 
 
+class FastARReferenceRunner:
+    """HF-math forward for the fast codebook head of ``Audio8TTSAR``.
+
+    Teacher-forces a whole frame (position 0 normed slow hidden followed by
+    embeddings of the previous reference codes) through the loaded fast
+    modules using explicit matmul attention -- the fast layers run with
+    ``use_sdpa=False`` upstream, so this mirrors the reference numerics more
+    closely than the production cached-SDPA decode path.
+    """
+
+    def __init__(self, ar_model) -> None:
+        self.ar = ar_model
+        self.device = next(ar_model.parameters()).device
+
+    def frame_logits(self, slow_hidden: torch.Tensor, emb_codes: torch.Tensor) -> torch.Tensor:
+        """slow_hidden: [H] normed; emb_codes: [num_codebooks - 1] codes c0..c_{N-2}.
+
+        Teacher-forces the frame the way ``_generate_codebooks`` does: position
+        0 consumes the slow hidden and only seeds attention; position p >= 1
+        consumes ``fast_embeddings(emb_codes[p - 1])`` and emits the logits
+        that sampled code c_p. Returns logits [num_codebooks, codebook_size].
+        """
+        n_pos = int(emb_codes.numel()) + 1
+        rows = [slow_hidden.reshape(-1).to(self.device)]
+        for c in emb_codes.to(self.device):
+            rows.append(self.ar.fast_embeddings(c.reshape(1)).reshape(-1))
+        x = torch.stack(rows).unsqueeze(0).to(torch.bfloat16)  # [1, P, H]
+
+        rope = self.ar.build_fast_rope(self.device)[:n_pos]
+        causal = torch.ones(n_pos, n_pos, dtype=torch.bool, device=self.device).tril()
+        mask = ~causal[None, None]
+
+        def attention(layer_attn, value):
+            b, t, _ = value.shape
+            q_size = layer_attn.n_head * layer_attn.head_dim
+            kv_size = layer_attn.n_local_heads * layer_attn.head_dim
+            q, k, v = layer_attn.wqkv(value).split((q_size, kv_size, kv_size), dim=-1)
+            q = q.view(b, t, layer_attn.n_head, layer_attn.head_dim)
+            k = k.view(b, t, layer_attn.n_local_heads, layer_attn.head_dim)
+            v = v.view(b, t, layer_attn.n_local_heads, layer_attn.head_dim)
+            if layer_attn.qk_norm:
+                q = layer_attn.q_norm(q)
+                k = layer_attn.k_norm(k)
+            q = apply_rope(q, rope).transpose(1, 2)
+            k = apply_rope(k, rope).transpose(1, 2)
+            v = v.transpose(1, 2)
+            repeats = layer_attn.n_head // layer_attn.n_local_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+            scores = q @ k.transpose(-2, -1) / (layer_attn.head_dim**0.5)
+            scores = scores.masked_fill(mask, float("-inf"))
+            out = torch.softmax(scores, dim=-1) @ v
+            return layer_attn.wo(out.transpose(1, 2).contiguous().view(b, t, q_size))
+
+        for layer in self.ar.fast_layers:
+            x = x + attention(layer.attention, rms(layer.attention_norm, x))
+            x = x + layer.feed_forward(rms(layer.ffn_norm, x))
+        return self.ar.fast_output(rms(self.ar.fast_norm, x))[0]
+
+
+def rms(norm_module, x: torch.Tensor) -> torch.Tensor:
+    normalized = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + norm_module.eps)
+    return normalized.to(x.dtype) * norm_module.weight
+
+
+def apply_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+    shaped = x.float().reshape(*x.shape[:-1], -1, 2)
+    rope = rope[None, :, None]
+    output = torch.stack(
+        (
+            shaped[..., 0] * rope[..., 0] - shaped[..., 1] * rope[..., 1],
+            shaped[..., 1] * rope[..., 0] + shaped[..., 0] * rope[..., 1],
+        ),
+        dim=-1,
+    )
+    return output.flatten(3).to(x.dtype)
+
+
 @pytest.fixture(scope="session")
 def slow_ar_runner(audio8_model):
     return SlowARSDPARunner(audio8_model)
+
+
+@pytest.fixture(scope="session")
+def fast_ar_runner(audio8_model):
+    return FastARReferenceRunner(audio8_model)

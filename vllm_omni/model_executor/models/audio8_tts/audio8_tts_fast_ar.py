@@ -178,24 +178,24 @@ class Audio8FastAttention(nn.Module):
             raise RuntimeError("Audio8 fast KV cache has not been initialized")
         key_cache, value_cache = self.audio8_cache.for_batch(batch)
 
-        # GQA-expand into query heads, write k/v at cache_positions, attend to
-        # the valid prefix.  Equivalent to the reference FA3 ``flash_attn_with_kvcache``
-        # call (causal=True over an already-causal prefix reduces to prefix masking).
+        # Write k/v at cache_positions, then attend with a prefix mask over the
+        # whole fixed-size cache (unwritten slots hold zeros and are masked out)
+        # -- mirrors the reference SDPA fallback; no host sync needed.
+        batch_indices = torch.arange(batch, device=value.device)
+        key_cache[batch_indices, cache_positions] = k[:, 0]
+        value_cache[batch_indices, cache_positions] = v[:, 0]
+        slots = key_cache.shape[1]
         repeat = self.n_head // self.n_local_heads
-        key_cache[torch.arange(batch, device=value.device), cache_positions] = k[:, 0]
-        value_cache[torch.arange(batch, device=value.device), cache_positions] = v[:, 0]
-        k_expanded = (
-            key_cache[:, :, None].expand(batch, -1, repeat, -1, -1).reshape(batch, self.n_head, -1, self.head_dim)
-        )
-        v_expanded = (
-            value_cache[:, :, None].expand(batch, -1, repeat, -1, -1).reshape(batch, self.n_head, -1, self.head_dim)
-        )
+        keys = key_cache.repeat_interleave(repeat, dim=2).transpose(1, 2)  # [B, H, S, D]
+        values = value_cache.repeat_interleave(repeat, dim=2).transpose(1, 2)
+        query = q.transpose(1, 2)  # [B, H, 1, D]
+        valid = torch.arange(slots, device=value.device)[None, :] <= cache_positions[:, None]
         output = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k_expanded,
-            v_expanded,
+            query,
+            keys,
+            values,
             scale=self.head_dim**-0.5,
-            is_causal=False,
+            attn_mask=valid[:, None, None, :],
         )
         return self.wo(output.transpose(1, 2).contiguous().view(batch, length, q_size))
 
