@@ -124,8 +124,10 @@ class OmniGPUWorkerBase(GPUWorker):
         # Upstream 58b2012aa2 added `total_consumed` to the profiling result
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
-        # true here). Mirror upstream so the omni override keeps it populated.
-        self.total_consumed = profile_result.total_consumed
+        # true here). Mirror upstream when present; older vintages compute
+        # consumption inline in GPUWorker instead.
+        if hasattr(profile_result, "total_consumed"):
+            self.total_consumed = profile_result.total_consumed
 
         process_memory = (
             get_process_gpu_memory(self.local_rank)

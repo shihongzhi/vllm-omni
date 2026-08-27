@@ -175,6 +175,32 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hs_dtype=self.dtype,
             )
 
+    @contextlib.contextmanager
+    def maybe_randomize_inputs(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None = None,
+        randomize_inputs: bool = False,
+    ):
+        """Extended hook around dummy-run inputs.
+
+        Mirrors upstream's env-driven DP dummy randomization and additionally
+        honours the explicit ``randomize_inputs`` flag passed by
+        :meth:`_dummy_run` (kernel warmup expert balancing).
+        """
+        if not randomize_inputs:
+            with super().maybe_randomize_inputs(input_ids, inputs_embeds):
+                yield
+            return
+
+        assert input_ids is not None or inputs_embeds is not None
+        logger.debug_once("Randomizing dummy inputs for kernel warmup")
+        source = self.input_ids.gpu if input_ids is not None else self.inputs_embeds.gpu
+        target = input_ids if input_ids is not None else inputs_embeds
+        target.copy_(torch.randint_like(source[: target.size(0)], 0, self.model_config.get_vocab_size()))
+        yield
+        target.fill_(0)
+
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
