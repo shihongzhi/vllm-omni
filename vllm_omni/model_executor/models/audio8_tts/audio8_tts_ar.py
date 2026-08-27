@@ -340,6 +340,12 @@ class Audio8TTSAR(nn.Module):
         device = slow_hidden.device
         current = (semantic - cfg.semantic_begin_id).clamp(0, cfg.codebook_size - 1)
         codes = [current]
+        if self.fast_layers[0].attention.audio8_cache is None:
+            # Dummy-weight runs (load_format=dummy) never reach load_weights,
+            # where the caches are normally allocated; allocate lazily so the
+            # engine still runs in that mode.
+            max_seqs = int(getattr(getattr(self.vllm_config, "scheduler_config", None), "max_num_seqs", 0) or 0)
+            self.setup_fast_decode(max(max_seqs, batch))
         for layer in self.fast_layers:
             layer.attention.clear_audio8_cache()
         hidden = self.fast_project_in(slow_hidden.reshape(batch, -1)).unsqueeze(1)
