@@ -260,6 +260,17 @@ _OMNI_MODELS = {
         "fish_speech_dac_decoder",
         "FishSpeechDACDecoder",
     ),
+    ## audio8_tts (Audio8 dual-AR TTS)
+    "ArkttsModel": (
+        "audio8_tts",
+        "audio8_tts_ar",
+        "Audio8TTSAR",
+    ),
+    "Audio8CodecDecoder": (
+        "audio8_tts",
+        "audio8_codec_decoder",
+        "Audio8CodecDecoder",
+    ),
     ## Gepard-1.0 (nineninesix) — single-stage native-AR FSQ/NanoCodec TTS
     "GepardTalkerForConditionalGeneration": (
         "gepard",

@@ -202,16 +202,29 @@ def test_compute_logits_masks_to_audio_ids(audio8_model):
 def test_make_omni_output_concatenates_codes(audio8_model):
     cfg = audio8_model.config
     hidden_dim = int(cfg.dim)
-    c1 = torch.arange(2 * int(cfg.num_codebooks)).reshape(2, -1)
-    c2 = torch.arange(4 * int(cfg.num_codebooks)).reshape(4, -1)
+    k = int(cfg.num_codebooks)
+    c1 = torch.arange(2 * k).reshape(2, -1)
+    c2 = torch.arange(4 * k).reshape(4, -1)
+    # The model accumulates one [K] row per decode step under _clip_codes,
+    # keyed by request id (as talker_mtp does).
+    audio8_model._clip_codes = {
+        "req-a": [row for row in c1],
+        "req-b": [row for row in c2],
+    }
     outputs = audio8_model.make_omni_output(
         torch.randn(9, hidden_dim),
         runtime_additional_information=[
-            {"codes": {"audio": c1}},
-            {"not_a_dict": 1},
-            {"codes": {"audio": c2}},
+            {"request_id": "req-a"},
+            {"request_id": "req-missing"},
+            {"request_id": "req-b"},
         ],
     )
-    codes = outputs.multimodal_outputs["audio_codes"]
-    assert codes.shape == (6, int(cfg.num_codebooks))
-    assert outputs.text_hidden_states.shape == (6, hidden_dim)
+    # One accumulated-codes tensor per request, batch-aligned; requests
+    # without codes get an empty placeholder.
+    codes = outputs.multimodal_outputs["codes"]["audio"]
+    assert isinstance(codes, list) and len(codes) == 3
+    assert codes[0].shape == (2, k) and torch.equal(codes[0], c1)
+    assert codes[1].shape == (0, k)
+    assert codes[2].shape == (4, k) and torch.equal(codes[2], c2)
+    # Hidden states stay full-height: logits rows align with them.
+    assert outputs.text_hidden_states.shape == (9, hidden_dim)

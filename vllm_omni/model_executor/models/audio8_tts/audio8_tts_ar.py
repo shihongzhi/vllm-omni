@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -84,6 +85,33 @@ _PROMPT_CLONE_SUFFIX = (
 )
 
 
+def estimate_audio8_prompt_len(
+    model_dir: str | Path,
+    target_text: str,
+    *,
+    ref_text: str | None = None,
+    ref_frames: int = 0,
+) -> int:
+    """Client-side prompt-token width used for placeholder ``prompt_token_ids``.
+
+    The engine's ``preprocess`` replaces those placeholders with real
+    embeddings built from ``additional_information``; only the length must be
+    right. Uses the checkpoint's own ``tokenizer.json``.
+    """
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+
+    def _enc(part: str) -> int:
+        return len(tokenizer.encode(part, add_special_tokens=False).ids)
+
+    if ref_frames <= 0 or not ref_text:
+        return sum(_enc(part.format(text=target_text)) for part in _PROMPT_NO_REF_PARTS)
+    prefix_len = sum(_enc(part.format(ref_text=ref_text)) for part in _PROMPT_CLONE_PREFIX)
+    suffix_len = sum(_enc(part.format(target=target_text)) for part in _PROMPT_CLONE_SUFFIX)
+    return prefix_len + ref_frames + suffix_len
+
+
 class Audio8TTSAR(nn.Module):
     """Dual-AR Audio8 model: slow AR (Qwen2 backbone) + fast codebook head."""
 
@@ -110,6 +138,11 @@ class Audio8TTSAR(nn.Module):
             ("state", "previous_valid"),
         }
         self.talker_mtp_graph_safe = True
+        # Accumulate per-request clips step-by-step (the shared runner buffer
+        # only ever holds the CURRENT step's codes); requires talker_mtp to
+        # receive req_ids below.
+        self.talker_mtp_accepts_req_infos = True
+        self._clip_codes: dict[str, list[Tensor]] = {}
 
         self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         self._fix_rope_style()
@@ -167,6 +200,10 @@ class Audio8TTSAR(nn.Module):
     def setup_fast_decode(self, max_batch_size: int) -> None:
         """Allocate the fast head's fixed KV caches (rope table already exists)."""
         device = self.codebook_embeddings.weight.device
+        # Under the engine's device-context construction nothing issues a
+        # global .to(), so an explicitly-CPU-built table would lag behind.
+        if self._fast_rope.device != device:
+            self._fast_rope = self._fast_rope.to(device)
         dtype = self.codebook_embeddings.weight.dtype
         cfg = self.config
         for layer in self.fast_layers:
@@ -370,21 +407,32 @@ class Audio8TTSAR(nn.Module):
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
 
-        frames: list[Tensor] = []
+        # One accumulated-codes tensor per request, in batch order: the payload
+        # splitter routes element[idx] to request idx, so requests without
+        # codes yet get an empty placeholder to keep the list aligned.
+        # Whole-clip view over the running accumulation (not consumed here;
+        # lifecycle reset happens at each request's first prefill).
+        num_codebooks = int(self.config.num_codebooks)
+        per_req_codes: list[Tensor] = []
+        have_codes = False
         for info in info_dicts:
-            if not isinstance(info, dict):
-                continue
-            ac = info.get("codes", {}).get("audio")
-            if isinstance(ac, Tensor):
-                frames.append(ac.reshape(ac.shape[0], -1))
-        if not frames:
-            logger.debug("make_omni_output: no audio codes in info dicts (len=%d)", len(info_dicts))
+            req_id = info.get("request_id") if isinstance(info, dict) else None
+            rows = self._clip_codes.get(req_id) if isinstance(req_id, str) else None
+            if rows:
+                per_req_codes.append(torch.cat([r.reshape(1, -1) for r in rows], dim=0))
+                have_codes = True
+            else:
+                per_req_codes.append(torch.empty((0, num_codebooks), dtype=torch.long))
+        if not have_codes:
+            logger.debug("make_omni_output: no accumulated clips (info=%d)", len(info_dicts))
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-        audio_codes = torch.cat(frames, dim=0)
-        span_len = int(audio_codes.shape[0])
-        mm: dict[str, Tensor] = {"audio_codes": audio_codes}
-        return OmniOutput(text_hidden_states=hidden[:span_len], multimodal_outputs=mm)
+        # Hidden states stay full-height: logits rows align with them, and the
+        # codes reach Stage 1 through the per-request list, not the hidden dim.
+        return OmniOutput(
+            text_hidden_states=hidden,
+            multimodal_outputs={"codes": {"audio": per_req_codes}},
+        )
 
     def preprocess(
         self,
@@ -425,6 +473,9 @@ class Audio8TTSAR(nn.Module):
                 return take, offset + span_len
 
             if is_first_prefill:
+                # Fresh clip: drop any codes accumulated by a previous request
+                # that reused this slot id.
+                self._clip_codes.pop(str(info_dict.get("request_id")), None)
                 ref_codes = info_dict.get("ref_codes")
                 ref_text = info_dict.get("ref_text")
                 has_ref = isinstance(ref_codes, Tensor) and ref_codes.numel() > 0
@@ -510,6 +561,8 @@ class Audio8TTSAR(nn.Module):
         text_step: Tensor,
         seed: int | None = None,
         generators: list[torch.Generator] | None = None,
+        req_ids: list[str] | None = None,
+        req_infos: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> tuple[Tensor, Tensor]:
         """Fast-head frame expansion for one decode step (graph-safe: pure).
@@ -550,6 +603,13 @@ class Audio8TTSAR(nn.Module):
         begin, end = int(cfg.semantic_begin_id), int(cfg.semantic_end_id)
         semantic_mask = (ids >= begin) & (ids <= end)
         composed = torch.where(semantic_mask.unsqueeze(-1), base + codebook_sum, base)
+
+        # Whole-clip accumulation per request (CPU copy keeps GPU footprint flat).
+        if req_ids is not None:
+            rows = codes.detach().to("cpu", torch.long)
+            for idx, req_id in enumerate(req_ids):
+                self._clip_codes.setdefault(str(req_id), []).append(rows[idx])
+
         return composed, codes.to(torch.long)
 
     # ------------------------------------------------------------------
@@ -645,18 +705,30 @@ class Audio8TTSAR(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        """Load checkpoint weights. Returns the set of consumed source names."""
+        """Load checkpoint weights.
+
+        Returns the set of LOADED PARAMETER names (the vLLM loader contract);
+        the consumed CHECKPOINT-SOURCE names are stashed on
+        ``self.last_consumed_source_names`` for test-time completeness checks.
+        """
         params = dict(self.named_parameters())
         consumed: set[str] = set()
+        loaded: set[str] = set()
+        self.last_consumed_source_names = consumed
+
+        def _record(param_name: str) -> None:
+            loaded.add(param_name)
+
         for name, loaded_weight in weights:
             if name in _NON_PERSISTENT_WEIGHTS:
                 consumed.add(name)
                 continue
             if name == "norm.weight":
                 self._load_direct("model.norm.weight", loaded_weight, params)
+                loaded.add("model.norm.weight")
                 consumed.add(name)
                 continue
-            if self._load_slow_weight(name, loaded_weight, params):
+            if self._load_slow_weight(name, loaded_weight, params, loaded=loaded):
                 consumed.add(name)
                 continue
             # The checkpoint stores the tied embedding as ``embeddings.weight``.
@@ -664,8 +736,9 @@ class Audio8TTSAR(nn.Module):
             target = params.get(target_name)
             if target is None:
                 raise KeyError(f"Unexpected Audio8 weight in checkpoint: {name}")
-            loader = getattr(target, "weight_loader", default_weight_loader)
-            loader(target, loaded_weight)
+            loader_fn = getattr(target, "weight_loader", default_weight_loader)
+            loader_fn(target, loaded_weight)
+            loaded.add(target_name)
             consumed.add(name)
 
         # Align RoPE cos/sin caches with the reference's bf16 table; see
@@ -679,7 +752,12 @@ class Audio8TTSAR(nn.Module):
         if truncated:
             logger.debug("Truncated %d RoPE cos/sin caches to bf16", truncated)
 
-        return consumed
+        # The fast head needs its fixed per-slot KV caches before the first
+        # talker_mtp call; size them to the scheduler's batch capacity.
+        max_seqs = int(getattr(getattr(self.vllm_config, "scheduler_config", None), "max_num_seqs", 0) or 0)
+        self.setup_fast_decode(max(1, max_seqs))
+
+        return loaded
 
     def _load_direct(
         self,
@@ -696,6 +774,8 @@ class Audio8TTSAR(nn.Module):
         name: str,
         loaded_weight: Tensor,
         params: dict[str, nn.Parameter],
+        *,
+        loaded: set[str] | None = None,
     ) -> bool:
         if not name.startswith("layers."):
             return False
@@ -717,23 +797,29 @@ class Audio8TTSAR(nn.Module):
                 continue
             prefix = "model." + name[: -len(source_suffix)]
             if target is None:
+                fused = prefix + "self_attn.qkv_proj." + ("bias" if source_suffix.endswith("bias") else "weight")
                 self._load_fused_qkv(
                     prefix,
                     loaded_weight,
                     params,
                     is_bias=source_suffix.endswith("bias"),
                 )
+                if loaded is not None:
+                    loaded.add(fused)
                 return True
             if isinstance(target, tuple):
                 target_suffix, shard_id = target
             else:
                 target_suffix, shard_id = target, None
-            parameter = params[prefix + target_suffix]
+            parameter_name = prefix + target_suffix
+            parameter = params[parameter_name]
             if shard_id is None:
                 loader = getattr(parameter, "weight_loader", default_weight_loader)
                 loader(parameter, loaded_weight)
             else:
                 parameter.weight_loader(parameter, loaded_weight, shard_id)
+            if loaded is not None:
+                loaded.add(parameter_name)
             return True
         return False
 

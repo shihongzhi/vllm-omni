@@ -25,7 +25,10 @@ EXPECTED_NUM_TENSORS = 226
 
 
 def test_all_checkpoint_tensors_consumed(audio8_model, audio8_checkpoint):
-    consumed = audio8_model.load_weights(audio8_checkpoint.items())
+    audio8_model.load_weights(audio8_checkpoint.items())
+    # load_weights returns loaded PARAM names (vLLM contract); the consumed
+    # checkpoint-source names are stashed for this completeness check.
+    consumed = audio8_model.last_consumed_source_names
     assert consumed == set(audio8_checkpoint.keys())
     assert len(consumed) == EXPECTED_NUM_TENSORS
 
