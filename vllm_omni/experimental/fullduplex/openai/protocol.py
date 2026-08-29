@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import copy
@@ -9,7 +12,6 @@ from uuid import uuid4
 
 
 class DuplexOverlapPolicy(str, Enum):
-    AUTO = "auto"
     LISTEN_ONLY = "listen_only"
     BARGE_IN_ON_SPEECH = "barge_in_on_speech"
 
@@ -101,7 +103,7 @@ class DuplexCapabilities:
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
-            supports_barge_in=False,
+            supports_barge_in=True,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -129,6 +131,8 @@ class DuplexCapabilities:
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
+            # Barge-in latency depends on client chunking and lacks hardware E2E
+            # measurement, so do not advertise an invented target.
             target_barge_in_latency_ms=None,
         )
 
@@ -815,6 +819,23 @@ class DuplexSession:
                 if name not in handled_fields:
                     current[str(name)] = copy.deepcopy(value)
 
+        return copy.deepcopy(self._response.stage_metrics)
+
+    def replace_response_stage_metric_snapshots(
+        self,
+        stage_metrics: Mapping[object, object] | None,
+    ) -> dict[str, dict[str, object]]:
+        """Merge cumulative chat snapshots by replacing each stage's latest value."""
+        if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
+            return copy.deepcopy(self._response.stage_metrics)
+
+        for raw_stage_id, raw_values in stage_metrics.items():
+            if not isinstance(raw_values, Mapping):
+                continue
+            stage_id = str(raw_stage_id)
+            self._response.stage_metrics[stage_id] = copy.deepcopy(dict(raw_values))
+            self._response.stage_metric_tpot_weighted_ms.pop(stage_id, None)
+            self._response.stage_metric_tpot_weight.pop(stage_id, None)
         return copy.deepcopy(self._response.stage_metrics)
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
