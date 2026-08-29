@@ -417,6 +417,28 @@ class ErnieImagePipeline(
         if prompt is None and prompt_embeds is None:
             raise ValueError("Must provide either `prompt` or `prompt_embeds`.")
 
+    def predict_noise(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_bth: torch.Tensor,
+        text_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-branch noise prediction consumed by CFGParallelMixin.
+
+        In CFG-parallel mode each rank calls this for exactly one branch
+        (positive on rank 0, negative on rank 1+); results are all-gathered
+        and combined per rank.
+        """
+        return self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            text_bth=text_bth,
+            text_lens=text_lens,
+            return_dict=False,
+        )[0]
+
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -520,14 +542,15 @@ class ErnieImagePipeline(
         sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1)
         self.scheduler.set_timesteps(sigmas=sigmas[:-1], device=device)
 
-        if self.do_classifier_free_guidance:
-            cfg_text_hiddens = list(uncond_text_hiddens) + list(text_hiddens)
-        else:
-            cfg_text_hiddens = text_hiddens
-
+        text_in_dim = self.transformer.config.text_in_dim
         text_bth, text_lens = self._pad_text(
-            text_hiddens=cfg_text_hiddens, device=device, dtype=dtype, text_in_dim=self.transformer.config.text_in_dim
+            text_hiddens=text_hiddens, device=device, dtype=dtype, text_in_dim=text_in_dim
         )
+        uncond_text_bth, uncond_text_lens = None, None
+        if self.do_classifier_free_guidance:
+            uncond_text_bth, uncond_text_lens = self._pad_text(
+                text_hiddens=uncond_text_hiddens, device=device, dtype=dtype, text_in_dim=text_in_dim
+            )
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(self.scheduler.timesteps):
@@ -536,28 +559,33 @@ class ErnieImagePipeline(
 
                 self._current_timestep = t
 
-                if self.do_classifier_free_guidance:
-                    latent_model_input = torch.cat([latents, latents], dim=0)
-                    t_batch = torch.full(
-                        (batch_size * num_images_per_prompt * 2,), t.item(), device=device, dtype=dtype
-                    )
-                else:
-                    latent_model_input = latents
-                    t_batch = torch.full((batch_size * num_images_per_prompt,), t.item(), device=device, dtype=dtype)
+                t_batch = torch.full((batch_size * num_images_per_prompt,), t.item(), device=device, dtype=dtype)
+                positive_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": t_batch,
+                    "text_bth": text_bth,
+                    "text_lens": text_lens,
+                }
+                negative_kwargs = (
+                    {
+                        "hidden_states": latents,
+                        "timestep": t_batch,
+                        "text_bth": uncond_text_bth,
+                        "text_lens": uncond_text_lens,
+                    }
+                    if self.do_classifier_free_guidance
+                    else None
+                )
 
-                pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=t_batch,
-                    text_bth=text_bth,
-                    text_lens=text_lens,
-                    return_dict=False,
-                )[0]
+                pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=self.do_classifier_free_guidance,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
 
-                if self.do_classifier_free_guidance:
-                    pred_uncond, pred_cond = pred.chunk(2, dim=0)
-                    pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
-
-                latents = self.scheduler.step(pred, t, latents, return_dict=False)[0]
+                latents = self.scheduler_step_maybe_with_cfg(pred, t, latents, self.do_classifier_free_guidance)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {k: locals()[k] for k in callback_on_step_end_tensor_inputs}

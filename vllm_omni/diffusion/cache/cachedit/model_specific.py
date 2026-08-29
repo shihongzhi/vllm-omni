@@ -836,6 +836,27 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def enable_cache_for_ernie_image(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Enable cache-dit for ERNIE-Image.
+
+    ``has_separate_cfg`` is checkpoint-dependent, mirroring the Krea 2 rationale:
+    the distilled Turbo checkpoint runs a single transformer forward per denoise
+    step (no CFG), while the base checkpoint runs separate cond/uncond forwards.
+    cache-dit tells the two apart purely by transformer-forward parity, so the
+    flag must match the actual per-step forward count. The pipeline exposes this
+    via ``is_distilled`` (auto-detected at init).
+    """
+    transformer = _default_get_pipeline_transformer(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=not pipeline.is_distilled,
+        check_forward_pattern=False,
+    )
+    return enable_cache_for_dit(pipeline, cache_config, block_adapter)
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -853,6 +874,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "ErnieImagePipeline": enable_cache_for_ernie_image,
         }
     )
 
