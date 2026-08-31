@@ -100,10 +100,12 @@ def generator2tokenizer_async_chunk(
     # Frames may still be on the GPU, so flatten on-device and issue a single
     # D2H copy for the whole window (one per chunk instead of one per frame).
     # torch.as_tensor passes tensors through zero-copy and still accepts the
-    # plain-int frames older seeds/tests may have stored.
-    code_predictor_codes = torch.cat(
-        [torch.as_tensor(f).reshape(-1) for f in window_frames]
-    ).cpu().tolist()
+    # plain-int frames older seeds/tests may have stored; stragglers on another
+    # device (e.g. pre-seeded CPU lists against CUDA frames) are moved to the
+    # producing device of the newest frame first. .to() is a no-op when the
+    # window is homogeneous.
+    frames = [torch.as_tensor(f).reshape(-1) for f in window_frames]
+    code_predictor_codes = torch.cat([f.to(frames[-1].device) for f in frames]).cpu().tolist()
 
     return OmniPayloadStruct(
         codes=CodesStruct(
