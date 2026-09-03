@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import threading
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -13,6 +14,27 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
+# Environment switch for the cross-process put notification (see
+# ``SharedMemoryConnector`` below).  Off by default: the notification is a
+# latency hint for the receiver's recv loop, and deployments that prefer the
+# established poll behaviour keep it unchanged.
+_CHUNK_NOTIFY_ENV = "VLLM_OMNI_CHUNK_NOTIFY"
+# Optional suffix separating concurrent deployments' notification sockets on
+# the same host (tests and multi-instance setups).  A collision is not a
+# correctness issue -- the receiver's bind fails and its recv loop keeps
+# polling -- but a distinct salt keeps the hint useful.
+_CHUNK_NOTIFY_SALT_ENV = "VLLM_OMNI_CHUNK_NOTIFY_SALT"
+
+
+def _chunk_notify_env_enabled() -> bool:
+    return os.environ.get(_CHUNK_NOTIFY_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _notify_endpoint(from_stage: str, to_stage: str) -> str:
+    salt = os.environ.get(_CHUNK_NOTIFY_SALT_ENV, "").strip()
+    suffix = f"_{salt}" if salt else ""
+    return f"ipc:///tmp/vllm_omni_chunk_notify_{from_stage}_{to_stage}{suffix}"
+
 
 class SharedMemoryConnector(OmniConnectorBase):
     """Key-addressed local shared-memory connector.
@@ -22,7 +44,17 @@ class SharedMemoryConnector(OmniConnectorBase):
     remote-transport metadata such as ``source_host`` / ``source_port``
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
+
+    Optionally (``extra["chunk_notify"]`` or ``VLLM_OMNI_CHUNK_NOTIFY=1``)
+    the connector pairs each SHM edge with a local ZMQ PUSH/PULL socket
+    keyed by the same ``(from_stage, to_stage)`` pair the ``put``/``get``
+    calls already carry.  A successful ``put`` pushes one zero-payload
+    hint so the receiver's recv thread can sleep on the socket instead of
+    polling ``shm_open`` on a fixed backoff.  The data plane is untouched:
+    a dropped or lost hint only costs the receiver its fallback poll.
     """
+
+    supports_chunk_notify = True
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -33,6 +65,145 @@ class SharedMemoryConnector(OmniConnectorBase):
             "gets": 0,
             "bytes_transferred": 0,
         }
+
+        # Per-edge opt-in (deploy yaml ``extra["chunk_notify"]``) wins over
+        # the global environment switch so a single deployment can A/B the
+        # notification channel edge by edge.
+        explicit_notify = config.get("chunk_notify")
+        self._chunk_notify_enabled = bool(explicit_notify) if explicit_notify is not None else _chunk_notify_env_enabled()
+
+        # Notification sockets are strictly thread-affine: PUSH is only
+        # created on the sender (save-loop) thread, PULL only on the
+        # receiver (recv-loop) thread.  ZeroMQ sockets must not be shared
+        # across threads, so the caches remember their owning thread and
+        # rebuild on a foreign thread instead of reusing.
+        self._notify_ctx = None
+        self._push_sockets: dict[tuple[str, str], Any] = {}
+        self._pull_sockets: dict[tuple[str, str], Any] = {}
+        self._pull_bind_failed: set[tuple[str, str]] = set()
+        self._notify_lock = threading.Lock()
+        self._notify_dropped = 0
+
+    # --- Optional chunk-notification protocol ---
+
+    def chunk_notify_enabled(self) -> bool:
+        return self._chunk_notify_enabled
+
+    def _notify_context(self):
+        # A dedicated context (rather than a global singleton) keeps close()
+        # able to tear everything down without affecting other connectors.
+        if self._notify_ctx is None:
+            import zmq
+
+            self._notify_ctx = zmq.Context()
+        return self._notify_ctx
+
+    def _get_push_socket(self, from_stage: str, to_stage: str):
+        import zmq
+
+        edge = (from_stage, to_stage)
+        entry = self._push_sockets.get(edge)
+        if entry is not None and entry[0] == threading.get_ident():
+            return entry[1]
+        if entry is not None:
+            self._close_socket(entry[1])
+        sock = self._notify_context().socket(zmq.PUSH)
+        # The receiver binds; the sender connects.  A PUSH that has
+        # connected but not yet reached the receiver queues hints in its
+        # local pipe (up to SNDHWM), so a hint fired before the receiver
+        # starts is delayed, not lost -- unlike a bound PUSH, whose
+        # non-blocking send with no peer drops immediately.
+        sock.setsockopt(zmq.SNDHWM, 1024)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(_notify_endpoint(from_stage, to_stage))
+        self._push_sockets[edge] = (threading.get_ident(), sock)
+        return sock
+
+    def _get_pull_socket(self, from_stage: str, to_stage: str):
+        import zmq
+
+        edge = (from_stage, to_stage)
+        if edge in self._pull_bind_failed:
+            return None
+        entry = self._pull_sockets.get(edge)
+        if entry is not None and entry[0] == threading.get_ident():
+            return entry[1]
+        if entry is not None:
+            self._close_socket(entry[1])
+        sock = self._notify_context().socket(zmq.PULL)
+        sock.setsockopt(zmq.RCVHWM, 1024)
+        sock.setsockopt(zmq.LINGER, 0)
+        try:
+            sock.bind(_notify_endpoint(from_stage, to_stage))
+        except Exception as e:
+            # Another receiver already bound this endpoint (same host,
+            # same edge numbering).  The hint is best-effort; keep the
+            # poll behaviour instead of failing the stage.  Cache the
+            # failure so the per-poll get() does not retry the bind (and
+            # churn a socket) on every pass.
+            sock.close()
+            self._pull_bind_failed.add(edge)
+            logger.debug("chunk-notify bind failed for edge %s->%s: %s", from_stage, to_stage, e)
+            return None
+        self._pull_sockets[edge] = (threading.get_ident(), sock)
+        return sock
+
+    @staticmethod
+    def _close_socket(sock) -> None:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def notify_chunk_put(self, from_stage: str, to_stage: str, put_key: str) -> None:
+        if not self._chunk_notify_enabled:
+            return
+        try:
+            import zmq
+
+            sock = self._get_push_socket(from_stage, to_stage)
+            if sock is None:
+                return
+            try:
+                sock.send(put_key.encode(), flags=zmq.DONTWAIT)
+            except zmq.Again:
+                self._notify_dropped += 1
+        except Exception as e:
+            # The notification is a pure hint on the send path: any failure
+            # here must be invisible to the chunk that was already written.
+            logger.debug("chunk-notify send failed for %s: %s", put_key, e)
+
+    def wait_for_chunk_notify(self, timeout_ms: int, wake_fds: tuple[int, ...] = ()) -> None:
+        import time
+
+        if not self._chunk_notify_enabled or (not self._pull_sockets and not wake_fds):
+            # Disabled, or nothing to sleep on yet (no receive edge was
+            # ever polled): a plain sleep keeps the recv loop's cadence
+            # instead of degenerating into a busy spin.
+            time.sleep(max(0, timeout_ms) / 1000.0)
+            return
+        try:
+            import zmq
+
+            poller = zmq.Poller()
+            for entry in self._pull_sockets.values():
+                poller.register(entry[1], zmq.POLLIN)
+            for fd in wake_fds:
+                poller.register(fd, zmq.POLLIN)
+            poller.poll(timeout=max(0, timeout_ms))
+            # Drain whatever arrived so the next wait starts empty.  The
+            # payload (the put key) is intentionally unread: the recv loop
+            # re-scans its whole pending set, so a hint only needs to wake
+            # it, not tell it which key landed.
+            for entry in list(self._pull_sockets.values()):
+                try:
+                    while True:
+                        entry[1].recv(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+        except Exception as e:
+            logger.debug("chunk-notify wait failed: %s", e)
+            time.sleep(max(0, timeout_ms) / 1000.0)
 
     def put(
         self,
@@ -50,6 +221,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 meta = shm_write_bytes(payload, name=put_key)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
+
+            if self._chunk_notify_enabled:
+                self.notify_chunk_put(from_stage, to_stage, put_key)
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}
@@ -122,6 +296,16 @@ class SharedMemoryConnector(OmniConnectorBase):
         get_key: str,
         metadata=None,
     ) -> tuple[Any, int] | None:
+        # The first poll on an edge registers it as a receive edge: the
+        # recv thread's PULL socket must exist before wait_for_chunk_notify
+        # can sleep on it.  Misses (chunk not yet written) still return
+        # None below; registering here keeps the notification channel
+        # ahead of the first possible hit.
+        if self._chunk_notify_enabled:
+            try:
+                self._get_pull_socket(from_stage, to_stage)
+            except Exception as e:
+                logger.debug("chunk-notify pull setup failed for edge %s->%s: %s", from_stage, to_stage, e)
         if metadata is not None:
             if isinstance(metadata, dict) and get_key in metadata:
                 metadata = metadata.get(get_key)
@@ -175,6 +359,19 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
+        with self._notify_lock:
+            for entry in list(self._push_sockets.values()):
+                self._close_socket(entry[1])
+            self._push_sockets.clear()
+            for entry in list(self._pull_sockets.values()):
+                self._close_socket(entry[1])
+            self._pull_sockets.clear()
+            ctx, self._notify_ctx = self._notify_ctx, None
+        if ctx is not None:
+            try:
+                ctx.term()
+            except Exception:
+                pass
         for key in list(self._pending_keys):
             try:
                 seg = shm_pkg.SharedMemory(name=key)
@@ -191,4 +388,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._pending_keys.clear()
 
     def health(self) -> dict[str, Any]:
-        return {"status": "healthy", **self._metrics}
+        return {
+            "status": "healthy",
+            "chunk_notify": self._chunk_notify_enabled,
+            "chunk_notify_dropped": self._notify_dropped,
+            **self._metrics,
+        }

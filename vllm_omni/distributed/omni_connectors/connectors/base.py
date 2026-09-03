@@ -17,6 +17,12 @@ class OmniConnectorBase(ABC):
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
 
+    # Whether the connector can signal the receiver right after a put()
+    # lands, so the transfer adapter's recv loop can sleep on the signal
+    # instead of polling.  Default False: connectors without an explicit
+    # notification channel keep the poll-and-backoff behaviour.
+    supports_chunk_notify: bool = False
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
@@ -58,6 +64,36 @@ class OmniConnectorBase(ABC):
     @abstractmethod
     def cleanup(self, request_id: str) -> None:
         """Clean up resources for a request."""
+        pass
+
+    # --- Optional chunk-notification protocol ---
+    # Used by the transfer adapter's recv loop.  Notifications are hints,
+    # never a correctness dependency: a lost or dropped signal must only
+    # cost the receiver its fallback poll, never a chunk.  The default
+    # no-op implementation leaves poll-driven connectors unchanged.
+
+    def notify_chunk_put(self, from_stage: str, to_stage: str, put_key: str) -> None:
+        """Best-effort signal that ``put_key`` has just landed for the edge.
+
+        Called on the sender side immediately after a successful ``put``.
+        Implementations must never block or raise on the send path; a
+        dropped notification is recovered by the receiver's fallback poll.
+        """
+        pass
+
+    def chunk_notify_enabled(self) -> bool:
+        """Whether the notification channel is active for this instance."""
+        return False
+
+    def wait_for_chunk_notify(self, timeout_ms: int, wake_fds: tuple[int, ...] = ()) -> None:
+        """Block until a notification or a wake fd is readable, or timeout.
+
+        Called from the receiver's recv thread between poll passes.
+        ``wake_fds`` are OS file descriptors (e.g. the adapter's wakeup
+        pipe) that must also interrupt the wait; implementations should
+        drain them or rely on the caller to do so.  Returning without any
+        event is allowed -- the caller always re-scans its pending set.
+        """
         pass
 
     @abstractmethod

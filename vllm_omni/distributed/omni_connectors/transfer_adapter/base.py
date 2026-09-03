@@ -9,6 +9,38 @@ from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 
+# How long the recv loop's busy backoff sleeps between poll passes when the
+# connector has no notification channel.  The historical fixed value was
+# 1 ms; deployments with latency headroom can lower it, and it doubles as
+# the documented knob for the poll-mode cadence (RFC #6870 task B1).
+_RECV_BACKOFF_ENV = "VLLM_OMNI_CHUNK_RECV_BACKOFF_MS"
+_DEFAULT_RECV_BACKOFF_MS = 1.0
+
+# When the connector *does* support chunk notifications (opt-in via
+# VLLM_OMNI_CHUNK_NOTIFY / connector extra["chunk_notify"]), the recv loop
+# sleeps on the notification channel and only re-polls after this fallback.
+# It exists purely to recover a dropped hint (sender-side HWM overflow,
+# socket teardown mid-put), so it can be far looser than the poll cadence.
+_NOTIFY_FALLBACK_ENV = "VLLM_OMNI_CHUNK_NOTIFY_FALLBACK_MS"
+_DEFAULT_NOTIFY_FALLBACK_MS = 25.0
+
+
+def _parse_positive_ms(env_name: str, default_ms: float) -> float:
+    import os
+
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return default_ms
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %sms.", env_name, raw, default_ms)
+        return default_ms
+    if value <= 0:
+        logger.warning("%s=%r must be positive; falling back to %sms.", env_name, raw, default_ms)
+        return default_ms
+    return value
+
 
 class OmniTransferAdapterBase:
     """Base class for managing data transfer via OmniConnector.
@@ -32,6 +64,9 @@ class OmniTransferAdapterBase:
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
 
+        self._recv_backoff_s = _parse_positive_ms(_RECV_BACKOFF_ENV, _DEFAULT_RECV_BACKOFF_MS) / 1000.0
+        self._notify_fallback_ms = _parse_positive_ms(_NOTIFY_FALLBACK_ENV, _DEFAULT_NOTIFY_FALLBACK_MS)
+
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
@@ -50,12 +85,29 @@ class OmniTransferAdapterBase:
     def create_connector(cls, model_config: Any):
         raise NotImplementedError
 
+    def _chunk_notify_active(self) -> bool:
+        """Whether the recv loop can sleep on connector notifications."""
+        connector = self.connector
+        return (
+            connector is not None
+            and getattr(connector, "supports_chunk_notify", False)
+            and connector.chunk_notify_enabled()
+        )
+
     def recv_loop(self):
         """Loop to poll for incoming data.
 
         Process each pending request exactly once per pass.  When no request
-        made progress, back off 1 ms instead of tight-spinning on failed
-        shm_open syscalls (which can burn a full CPU core).
+        made progress, sleep until the next poll instead of tight-spinning
+        on failed shm_open syscalls (which can burn a full CPU core):
+
+        - notification-capable connector: sleep on the connector's
+          notification channel (RFC #6870 task B1) and re-poll after the
+          fallback timeout.  A lost notification only costs the fallback;
+          the data path itself never depends on it.
+        - otherwise: back off on the condition variable for
+          ``VLLM_OMNI_CHUNK_RECV_BACKOFF_MS`` (default 1 ms, the historical
+          fixed cadence).
         """
         while not self.stop_event.is_set():
             n = len(self._pending_load_reqs)
@@ -84,7 +136,19 @@ class OmniTransferAdapterBase:
                 if not self._pending_load_reqs and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.1)
                 elif not any_success and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.001)
+                    if self._chunk_notify_active():
+                        # Sleep outside the condition lock: registration
+                        # (load_async) notifies this condition and must
+                        # never queue behind a sleeping receiver.  A
+                        # registration that races here is picked up by the
+                        # fallback timeout at the latest.
+                        self._recv_cond.release()
+                        try:
+                            self.connector.wait_for_chunk_notify(self._notify_fallback_ms)
+                        finally:
+                            self._recv_cond.acquire()
+                    else:
+                        self._recv_cond.wait(timeout=self._recv_backoff_s)
 
     def record_send_failure(self, request_id: str | None, reason: str) -> None:
         """Note that a chunk for *request_id* will never be delivered.
