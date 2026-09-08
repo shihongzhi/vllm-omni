@@ -22,9 +22,6 @@ _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
 # <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
 # matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
 _DUPLEX_VISION_TOKENS_PER_FRAME = 66
-# Official stacked pair uses max_slice_nums=[2, 1]: the current frame is HD
-# sliced (1 source + 2 patches on 960x540) and the composite is not.
-_DUPLEX_HD_SLICES_PER_BASE_FRAME = 3
 
 
 def _duplex_frame_count(payload: object) -> int:
@@ -40,15 +37,13 @@ def _duplex_vision_tokens(payload: object) -> int:
     """Scheduler slots for this append's camera track.
 
     Audio is never stacked: a unit still carries one second of soundtrack.
-    ``stack_frames`` only adds a second *image*. Official HD on that pair is
-    ``[2, 1]``, so the base frame reserves three 66-token blocks and every
-    extra frame reserves one.
+    ``stack_frames`` only adds a second *image*. Stage-0 encodes every frame
+    as ``<image> + 64 + </image>`` (66 tokens); the Realtime adapter rejects
+    ``max_slice_nums > 1``, so HD slicing never inflates the reserve.
     """
     count = _duplex_frame_count(payload)
     if count <= 0:
         return 0
-    if count >= 2:
-        return (_DUPLEX_HD_SLICES_PER_BASE_FRAME + (count - 1)) * _DUPLEX_VISION_TOKENS_PER_FRAME
     return count * _DUPLEX_VISION_TOKENS_PER_FRAME
 
 

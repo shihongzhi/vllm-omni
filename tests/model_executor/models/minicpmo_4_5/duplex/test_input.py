@@ -177,3 +177,47 @@ def test_pcm_commit_reservation_rollback_restores_residual_audio():
     )
     assert retried.payload is not None
     assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
+
+
+def test_stacked_frames_drain_with_their_audio_unit():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    for unit in range(8):
+        payload = pcm_payload(16_000, speech=False)
+        payload["video_frames"] = [f"frame-{unit}-base", f"frame-{unit}-composite"]
+        emitted = buffer.append(payload, chunk_period_ms=1_000)
+
+        assert emitted is not None
+        assert emitted["video_frames"] == [f"frame-{unit}-base", f"frame-{unit}-composite"]
+        assert buffer._frame_queue == []
+
+
+def test_single_frame_per_unit_keeps_queue_empty():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    for unit in range(8):
+        payload = pcm_payload(16_000, speech=False)
+        payload["video_frames"] = [f"frame-{unit}"]
+        emitted = buffer.append(payload, chunk_period_ms=1_000)
+
+        assert emitted is not None
+        assert emitted["video_frames"] == [f"frame-{unit}"]
+        assert buffer._frame_queue == []
+
+
+def test_frame_rollback_restores_all_stacked_frames_to_the_queue_front():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    reservation = buffer.prepare_append(
+        pcm_payload(16_000, speech=False) | {"video_frames": ["base", "composite"]},
+        operation_id="stacked-unit",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation is not None
+    assert reservation.payload["video_frames"] == ["base", "composite"]
+    reservation.rollback()
+
+    assert buffer._frame_queue == ["base", "composite"]
+    emitted = buffer.append(pcm_payload(16_000, speech=False), chunk_period_ms=1_000)
+    assert emitted["video_frames"] == ["base", "composite"]

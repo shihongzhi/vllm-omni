@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.runtime import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
+    _duplex_vision_tokens,
     build_duplex_data_plane_prompt,
     duplex_scheduler_token_budget,
 )
@@ -481,3 +482,12 @@ def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
     assert len(prompt["prompt_token_ids"]) == 16
     assert prompt["model_intermediate_buffer"]["duplex"]["fence"] == fence
     assert prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 16
+
+
+def test_duplex_vision_tokens_match_stage0_encoding_per_frame():
+    # Stage-0 encodes every frame as <image>+64+</image> (66 tokens); the
+    # Realtime adapter rejects max_slice_nums > 1, so a stacked pair must
+    # reserve exactly two 66-token blocks -- no HD-slice surplus padding KV.
+    assert _duplex_vision_tokens({"video_frames": []}) == 0
+    assert _duplex_vision_tokens({"video_frames": ["base"]}) == 66
+    assert _duplex_vision_tokens({"video_frames": ["base", "composite"]}) == 132

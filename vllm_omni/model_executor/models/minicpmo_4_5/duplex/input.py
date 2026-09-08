@@ -116,8 +116,8 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
-        # Omni duplex: queued camera frames (base64 JPEG), consumed FIFO at
-        # one frame per emitted model unit alongside the unit's audio.
+        # Omni duplex: queued camera frames (base64 JPEG), drained FIFO onto
+        # the next emitted model unit alongside the unit's audio.
         self._frame_queue: list[str] = []
 
     def clear(self) -> None:
@@ -284,16 +284,16 @@ class MiniCPMO45PcmAppendBuffer:
         out.pop("video_frames", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
-        # Omni duplex: attach at most one queued camera frame per emitted
-        # model unit (official cadence: one frame per 1 s chunk). The engine
-        # budgets 66 scheduler slots per attached frame from this payload.
-        # Official omni cadence is one frame per ~1 s chunk, and the first
-        # append consumes extra samples (1035 ms first window), so per-unit
-        # attachment could outrun the units Stage0 actually builds. Attach at
-        # most ONE frame per emitted payload; the rest stay queued.
+        # Omni duplex: attach every frame queued for this unit. The wire
+        # contract allows up to 2 frames per append (stack_frames=2 sends the
+        # base + composite on the same unit) and the engine budgets 66
+        # scheduler slots per attached frame, so draining the queue keeps
+        # frames aligned with their 1 s audio unit instead of accumulating
+        # leftovers when the client stacks frames.
         attached_frames: list[str] = []
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
-            attached_frames = [self._frame_queue.pop(0)]
+            attached_frames = list(self._frame_queue)
+            self._frame_queue.clear()
             out["video_frames"] = attached_frames
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
         out["is_speech"] = any(span.is_speech for span in reserved_spans)
