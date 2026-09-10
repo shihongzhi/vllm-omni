@@ -116,8 +116,10 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
-        # Omni duplex: queued camera frames (base64 JPEG), drained FIFO onto
-        # the next emitted model unit alongside the unit's audio.
+        # Omni duplex: queued camera frames (base64 JPEG). Frames ride the
+        # unit-closing append (wire contract: at most two images per unit),
+        # so the queue holds exactly the current unit's frames by the time a
+        # whole unit is emitted and drains fully alongside its audio.
         self._frame_queue: list[str] = []
 
     def clear(self) -> None:
@@ -284,15 +286,16 @@ class MiniCPMO45PcmAppendBuffer:
         out.pop("video_frames", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
-        # Omni duplex: attach every frame queued for this unit. The wire
-        # contract allows up to 2 frames per append (stack_frames=2 sends the
-        # base + composite on the same unit) and the engine budgets 66
-        # scheduler slots per attached frame, so draining the queue keeps
-        # frames aligned with their 1 s audio unit instead of accumulating
-        # leftovers when the client stacks frames.
+        # Omni duplex: attach every camera frame queued while this unit's
+        # audio accumulated. Frames ride the unit-closing append (wire
+        # contract: at most two images, base frame plus optional stacked
+        # composite), so a contract-following client queues exactly this
+        # unit's frames and the queue drains fully each unit. The engine
+        # budgets 66 scheduler slots per attached frame from this payload,
+        # so attaching a partial set would desync later units' frames.
         attached_frames: list[str] = []
         if emit_samples + pad_samples >= min_samples and self._frame_queue:
-            attached_frames = list(self._frame_queue)
+            attached_frames = self._frame_queue[:]
             self._frame_queue.clear()
             out["video_frames"] = attached_frames
         out["force_listen"] = any(span.force_listen for span in reserved_spans)
@@ -354,8 +357,12 @@ class MiniCPMO45PcmAppendBuffer:
 
         # Open the next physical input generation without touching already
         # reserved appends. A rollback restores this generation's metadata.
+        # Unattached frames belong to a unit this generation never closed;
+        # carrying them into the next input would play them against the
+        # wrong audio.
         self._sample_rate_hz = None
         self._turn_had_speech = False
+        self._frame_queue.clear()
         return reservation
 
     def append(

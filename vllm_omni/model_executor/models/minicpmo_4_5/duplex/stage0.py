@@ -819,12 +819,16 @@ class MiniCPMO45Stage0DuplexRuntime:
         return int(self.image_start_token_id), int(self.image_end_token_id)
 
     def _official_max_slice_nums(self, frame_count: int) -> list[int]:
-        """Official stacked pair uses HD on the current frame only: ``[2, 1]``."""
-        if frame_count <= 0:
-            return []
-        if frame_count == 1:
-            return [1]
-        return [2] + [1] * (frame_count - 1)
+        """Streaming frames encode as single 448-normalized tiles.
+
+        The duplex adapter does not implement HD slicing (the Realtime input
+        validation rejects ``max_slice_nums > 1``), so every frame_list entry
+        builds exactly one 64-embed block and the scheduler budget stays
+        linear in the frame count. Official suggests HD on a stacked base
+        frame (``[2, 1]``); re-enable per-frame slicing here together with
+        ``_duplex_vision_tokens`` once that lands.
+        """
+        return [1] * frame_count if frame_count > 0 else []
 
     def _encode_processed_vision(self, processed: Any) -> list[Any] | None:
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
@@ -873,12 +877,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         """Encode camera frames for omni duplex via the loaded vision tower.
 
         Official ``streaming_prefill`` encodes each ``frame_list`` entry as its
-        own image (source + optional HD slices) and never stacks audio: the
-        unit still carries one second of soundtrack. A stacked pair uses
-        ``max_slice_nums=[2, 1]`` so the current frame keeps the elevator
-        display readable and the composite stays a single 448-normalized tile.
-        Frames are processed one at a time because ``process_image([a, b])``
-        packs both PILs into one batch item.
+        own image and never stacks audio: the unit still carries one second
+        of soundtrack. Every frame is one 448-normalized tile (HD slicing is
+        unimplemented by the duplex adapter), so a stacked pair is the base
+        frame plus its composite tile. Frames are processed one at a time
+        because ``process_image([a, b])`` packs both PILs into one batch
+        item.
         """
         process_image = getattr(self.processor, "process_image", None)
         if not callable(process_image):
@@ -890,7 +894,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
             encoded = self._encode_processed_vision(processed)
-            if encoded is None:
+            # The scheduler reserved max_slices blocks per frame; a processor
+            # that produced a different count would silently desync the
+            # budget and pad or truncate the unit inside the KV.
+            if encoded is None or len(encoded) != max_slices:
                 return None
             out.append(encoded)
         return out

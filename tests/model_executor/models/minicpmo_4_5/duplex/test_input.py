@@ -22,6 +22,12 @@ def pcm_payload(samples: int, *, speech: bool = True) -> dict[str, object]:
     }
 
 
+def video_payload(samples: int, frames: list[str], *, speech: bool = True) -> dict[str, object]:
+    payload = pcm_payload(samples, speech=speech)
+    payload["video_frames"] = frames
+    return payload
+
+
 def test_commit_does_not_add_silence_after_incremental_audio_was_drained():
     buffer = MiniCPMO45PcmAppendBuffer()
 
@@ -179,45 +185,79 @@ def test_pcm_commit_reservation_rollback_restores_residual_audio():
     assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
 
 
-def test_stacked_frames_drain_with_their_audio_unit():
+@pytest.mark.parametrize("units", [8, 64])
+def test_stacked_pair_drains_fully_each_unit(units):
+    """Frames ride the unit-closing append; both must attach to that unit.
+
+    Attaching only one frame per emit left the composite queued forever
+    (one leftover frame per second of video) and shifted later units onto
+    stale frames.
+    """
     buffer = MiniCPMO45PcmAppendBuffer()
 
-    for unit in range(8):
-        payload = pcm_payload(16_000, speech=False)
-        payload["video_frames"] = [f"frame-{unit}-base", f"frame-{unit}-composite"]
-        emitted = buffer.append(payload, chunk_period_ms=1_000)
-
+    for _ in range(units):
+        emitted = buffer.append(video_payload(16_000, ["base", "composite"]), chunk_period_ms=1_000)
         assert emitted is not None
-        assert emitted["video_frames"] == [f"frame-{unit}-base", f"frame-{unit}-composite"]
-        assert buffer._frame_queue == []
+        assert emitted["video_frames"] == ["base", "composite"]
+
+    # A frameless follow-up unit must stay frameless: any leftover frame
+    # from the drained units would surface here (FIFO queue).
+    followup = buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
+    assert followup is not None
+    assert "video_frames" not in followup
 
 
-def test_single_frame_per_unit_keeps_queue_empty():
+def test_single_frame_per_unit_attaches_to_its_unit():
     buffer = MiniCPMO45PcmAppendBuffer()
 
-    for unit in range(8):
-        payload = pcm_payload(16_000, speech=False)
-        payload["video_frames"] = [f"frame-{unit}"]
-        emitted = buffer.append(payload, chunk_period_ms=1_000)
+    emitted = buffer.append(video_payload(16_000, ["base"]), chunk_period_ms=1_000)
+    followup = buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
 
-        assert emitted is not None
-        assert emitted["video_frames"] == [f"frame-{unit}"]
-        assert buffer._frame_queue == []
+    assert emitted is not None
+    assert emitted["video_frames"] == ["base"]
+    assert followup is not None
+    assert "video_frames" not in followup
 
 
-def test_frame_rollback_restores_all_stacked_frames_to_the_queue_front():
+def test_frames_wait_for_the_unit_they_close():
+    """Client cadence: frames ride the append that completes the 1 s unit."""
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    for _ in range(4):
+        assert buffer.append(video_payload(3_200, []), chunk_period_ms=1_000) is None
+
+    emitted = buffer.append(video_payload(3_200, ["base", "composite"]), chunk_period_ms=1_000)
+    assert emitted is not None
+    assert emitted["video_frames"] == ["base", "composite"]
+    assert not buffer.has_pending()
+
+
+def test_commit_drops_frames_of_units_that_never_closed():
+    """Unattached frames belong to the committed generation, not the next."""
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    assert buffer.append(video_payload(8_000, ["orphan"], speech=False), chunk_period_ms=1_000) is None
+    committed = buffer.commit(chunk_period_ms=1_000)
+    assert committed is None  # no speech in the generation -> no terminal flush
+
+    emitted = buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
+    assert emitted is not None
+    assert "video_frames" not in emitted
+
+
+def test_append_rollback_restores_queued_frames():
     buffer = MiniCPMO45PcmAppendBuffer()
 
     reservation = buffer.prepare_append(
-        pcm_payload(16_000, speech=False) | {"video_frames": ["base", "composite"]},
-        operation_id="stacked-unit",
+        video_payload(16_000, ["base", "composite"]),
+        operation_id="append-frames",
         chunk_period_ms=1_000,
     )
-
     assert reservation is not None
+    assert reservation.payload is not None
     assert reservation.payload["video_frames"] == ["base", "composite"]
     reservation.rollback()
 
-    assert buffer._frame_queue == ["base", "composite"]
-    emitted = buffer.append(pcm_payload(16_000, speech=False), chunk_period_ms=1_000)
-    assert emitted["video_frames"] == ["base", "composite"]
+    retried = buffer.flush(chunk_period_ms=1_000)
+    assert retried is not None
+    assert retried["video_frames"] == ["base", "composite"]

@@ -19,8 +19,10 @@ from vllm_omni.engine.duplex.runtime import (
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
-# <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
-# matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
+# <image> + 64 resampler embeddings + </image> per frame, matching
+# MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME. The duplex adapter encodes
+# every frame at max_slice_nums=1 (HD slicing is unimplemented), so a
+# stacked base+composite pair is exactly two of these blocks.
 _DUPLEX_VISION_TOKENS_PER_FRAME = 66
 
 
@@ -37,14 +39,13 @@ def _duplex_vision_tokens(payload: object) -> int:
     """Scheduler slots for this append's camera track.
 
     Audio is never stacked: a unit still carries one second of soundtrack.
-    ``stack_frames`` only adds a second *image*. Stage-0 encodes every frame
-    as ``<image> + 64 + </image>`` (66 tokens); the Realtime adapter rejects
-    ``max_slice_nums > 1``, so HD slicing never inflates the reserve.
+    ``stack_frames`` only adds a second *image*, and every frame encodes as
+    exactly one ``<image>`` + 64 + ``</image>`` block, so the budget is
+    linear in the attached frame count and matches Stage0 output
+    token-for-token. Surplus slots would become pad embeddings inside the
+    KV and corrupt the model's listen/speak behavior.
     """
-    count = _duplex_frame_count(payload)
-    if count <= 0:
-        return 0
-    return count * _DUPLEX_VISION_TOKENS_PER_FRAME
+    return _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
 
 
 def _duplex_pcm_sample_count(payload: object) -> int | None:
