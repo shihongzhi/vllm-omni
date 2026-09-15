@@ -28,7 +28,6 @@ part of the vLLM weights iterator (the codec owns its own checkpoint; see the
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -39,7 +38,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
-from vllm_omni.metrics.duplex_frame_timing import duplex_frame_timing_enabled, log_frame_timing
+from vllm_omni.metrics.duplex_frame_timing import frame_timing_clock, log_stage1_decode_event
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -228,16 +227,9 @@ class PersonaPlexCode2Wav(nn.Module):
             delta_kf = self._new_code_suffix(state_id, codes_kf)
             if delta_kf.shape[1] == 0:
                 continue
-            timing_on = duplex_frame_timing_enabled()
-            decode_t0 = time.perf_counter() if timing_on else 0.0
+            decode_t0 = frame_timing_clock()
             wav = self._decode_streaming_frames(state_id, delta_kf.to(device=device))
-            if timing_on:
-                log_frame_timing(
-                    "stage1_decode",
-                    request_id=state_id if state_id is not None else "unknown",
-                    frames=int(delta_kf.shape[1]),
-                    decode_ms=(time.perf_counter() - decode_t0) * 1e3,
-                )
+            log_stage1_decode_event(state_id, int(delta_kf.shape[1]), decode_t0)
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
 

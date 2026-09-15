@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import time
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -15,8 +16,13 @@ from vllm_omni.metrics import duplex_frame_timing
 from vllm_omni.metrics.duplex_frame_timing import (
     DuplexTickPacer,
     duplex_frame_timing_enabled,
+    frame_timing_clock,
     get_tick_pacer,
+    log_append_event,
+    log_audio_emit_event,
+    log_connector_get_event,
     log_frame_timing,
+    log_stage1_decode_event,
     pop_chunk_put_age_ms,
     record_chunk_put,
 )
@@ -226,6 +232,125 @@ def test_record_chunk_put_requires_the_flag(
     record_chunk_put("r1_0_0")
 
     assert pop_chunk_put_age_ms("r1_0_0") is None
+
+
+def test_append_event_reports_tick_period_with_default_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(duplex_frame_timing, "_tick_pacers", OrderedDict())
+
+    with _capture_module_logs(caplog):
+        # Capabilities advertise 80 ms; a missing value falls back to the
+        # duplex tick default rather than a per-site constant.
+        log_append_event("s1", 2, 7680, 80)
+        log_append_event("s1", 2, 7680, None)
+
+    first, second = _lines(caplog)
+    assert first.startswith("DUPLEX_FRAME_TIMING event=append t_ns=")
+    assert "bytes=7680" in first
+    assert "tick_period_ms=80.000" in first
+    assert "tick_period_ms=80.000" in second
+
+
+def test_append_event_skips_empty_reservations_and_the_disabled_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _capture_module_logs(caplog):
+        log_append_event("s1", 2, 0, 80)
+
+    assert _lines(caplog) == []
+
+    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+    with _capture_module_logs(caplog):
+        log_append_event("s1", 2, 7680, 80)
+
+    assert _lines(caplog) == []
+
+
+def test_audio_emit_event_derives_frames_from_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(duplex_frame_timing, "_tick_pacers", OrderedDict())
+
+    with _capture_module_logs(caplog):
+        log_audio_emit_event("s1", 1, "req-1", {"audio_duration_ms": 240}, 80)
+
+    (line,) = _lines(caplog)
+    assert line.startswith("DUPLEX_FRAME_TIMING event=audio_emit t_ns=")
+    assert "request_id=req-1" in line
+    assert "frames=3" in line
+    assert "audio_duration_ms=240.000" in line
+
+
+@pytest.mark.parametrize(
+    "audio_result",
+    [None, "text-delta", {}, {"audio_duration_ms": 0}, {"audio_duration_ms": "n/a"}],
+)
+def test_audio_emit_event_skips_non_cadence_results(
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+    audio_result: object,
+) -> None:
+    with _capture_module_logs(caplog):
+        log_audio_emit_event("s1", 1, "req-1", audio_result, 80)
+
+    assert _lines(caplog) == []
+
+
+def test_connector_get_event_reports_chunk_age(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(duplex_frame_timing, "_put_stamps_ns", OrderedDict())
+    record_chunk_put("r1_0_0", t_ns=time.monotonic_ns() - 1_500_000)
+
+    with _capture_module_logs(caplog):
+        log_connector_get_event("r1_0_0", 1, 128, frame_timing_clock())
+
+    (line,) = _lines(caplog)
+    assert line.startswith("DUPLEX_FRAME_TIMING event=connector_get t_ns=")
+    assert "bytes=128" in line
+    assert "wrap_ms=" in line
+    # Cross-process gets have no same-process put to join on.
+    assert "chunk_age_ms=" in line
+    assert "chunk_age_ms=na" not in line
+
+
+def test_site_hooks_are_free_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+
+    assert frame_timing_clock() == 0.0
+    with _capture_module_logs(caplog):
+        log_stage1_decode_event("req-1", 5, frame_timing_clock())
+
+    assert _lines(caplog) == []
+    # No perf_counter stamp is taken while disabled, so wrap timings stay
+    # free of clock reads on the disabled path.
+    assert duplex_frame_timing_enabled() is False
+
+
+def test_stage1_decode_event_maps_missing_request_id(
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _capture_module_logs(caplog):
+        log_stage1_decode_event(None, 5, frame_timing_clock())
+
+    (line,) = _lines(caplog)
+    assert line.startswith("DUPLEX_FRAME_TIMING event=stage1_decode t_ns=")
+    assert "request_id=unknown" in line
+    assert "frames=5" in line
+    assert "decode_ms=" in line
 
 
 def test_connector_put_site_emits_and_stamps(
