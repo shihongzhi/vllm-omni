@@ -12,11 +12,12 @@ with the client/benchmark metrics proposed in #7242 / #7025.
 
 Measurement points — one line per frame/chunk at each site, emitted through
 a dedicated ``log_*_event`` helper. The event schema (fields, gating, cadence
-state) lives in this module only: call sites are single calls, so the hooks
-in files the duplex framework rework (#7413) deletes — the session runner and
-the runtime bridge — move to the new session owner unchanged.
+state) lives in this module only: call sites are single calls, so a hook can
+follow its site across layer moves unchanged (the append and audio_emit hooks
+moved from the deleted serving-layer session runner / runtime bridge to the
+engine-resident session owner with the #7413 rework).
 
-- ``append`` (duplex session runner, API server): a tick-sized user frame was
+- ``append`` (duplex session runner, engine): a tick-sized user frame was
   framed and reserved for the engine. Reports inter-append ``jitter_ms`` and
   input ``drift_ms`` against the tick budget.
 - ``connector_put`` (chunk transfer adapter, stage worker): chunk written
@@ -28,8 +29,8 @@ the runtime bridge — move to the new session owner unchanged.
   processes, join ``key`` + ``t_ns`` from the two lines offline.
 - ``stage1_decode`` (PersonaPlex Code2Wav, stage-1 worker): streaming Mimi
   decode time for the new frames of a request.
-- ``audio_emit`` (runtime bridge, API server): an audio delta was projected
-  for the client. Reports emit ``jitter_ms`` and output ``drift_ms`` against
+- ``audio_emit`` (model channel, engine): an audio delta was projected for
+  the client. Reports emit ``jitter_ms`` and output ``drift_ms`` against
   the tick budget — the server-side counterpart of the client receive
   timeline.
 
