@@ -22,6 +22,7 @@ from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
     BLOCK_SIZE,
     BUCKETS,
     TAIL_STEP,
+    THINK_REACHABLE_MAX_BUCKET,
     PagedDecodeCache,
     _bucket_for,
 )
@@ -804,3 +805,140 @@ def test_the_dummy_warmup_request_drives_one_decode_step(monkeypatch):
 
 class _StopForwardError(Exception):
     """Stops ``forward`` right after the warmup hook, so the test needs no model."""
+
+
+# ---------------------------------------------------------------------------
+# Readiness capture. The dummy warmup request above is think off, so without
+# this the first think request pays for its own captures: one per bucket
+# boundary it crosses, about 0.7 s across the 512 and 1024 ones, hidden by
+# medians and carried by its P100.
+# ---------------------------------------------------------------------------
+
+
+class _CountingRunner:
+    """Stands in for ``DecodeGraphRunner``: records steps, counts captures."""
+
+    def __init__(self, lm, cache, device):
+        self.cache = cache
+        self.captures = 0
+        self.steps = 0
+
+    def step(self, token, t_index):
+        self.steps += 1
+        if self.steps == 1:
+            self.captures += 1
+
+
+def test_readiness_warm_grows_the_stash_to_the_think_reachable_bucket(monkeypatch):
+    """One capture at startup has to replace the ones the first requests paid.
+
+    The stash the warmup leaves must be the bucket a think decode tops out at,
+    not the one its two-token prefill rounds up to -- a cache left at 512 would
+    hand the first think request the same grow-and-recapture it was built to
+    avoid.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2))
+
+    cache, runner = host._paged_decode
+    assert cache.bucket == THINK_REACHABLE_MAX_BUCKET
+    assert runner.captures == 1, "readiness left the graph to the first request"
+
+
+def test_serving_below_the_warm_bucket_takes_the_stash_without_rebuilding(monkeypatch):
+    """The warm stash is only worth what ``_decode_context`` does with it.
+
+    A request whose own prefix would have demanded a bigger bucket than a
+    lazily-built cache (600 rounds up to 1024, the first request's to 512) must
+    reuse the pre-grown one instead of rebuilding -- rebuilding the cache is
+    what re-captures the graph.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2))
+    stash = host._paged_decode
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    served = ctx(host, _dyn_cache(600))
+    assert served[0] is stash[0], "the warm cache was rebuilt for a request that fits it"
+    assert served[1] is stash[1], "the warm runner was rebuilt, so its capture is gone"
+    assert served[0].bucket == THINK_REACHABLE_MAX_BUCKET
+    assert stash[1].captures == 1, "reuse must not re-capture"
+
+
+def test_warm_leaves_no_stash_when_it_cannot_be_reused(monkeypatch):
+    """Whatever warmup captures has to obey the same rules serving does: the
+    kill switch, the device probe, dynamic LoRA and a missing prefill cache
+    each mean the graph would never be replayed, so none may be left behind."""
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+
+    monkeypatch.setenv("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "0")
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "the switch was ignored"
+
+    monkeypatch.setenv("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1")
+    monkeypatch.setattr(pipe_mod, "paged_decode_supported", lambda dev, head_dim: False)
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "an unsupported device captured"
+
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+    host.language_model.add_module("q_proj", _FakeLoRAWrapper())
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "warm captured across LoRA wrappers"
+
+    warm(host, None)
+    assert getattr(host, "_paged_decode", None) is None
+
+
+def test_a_failed_prefill_warmup_still_tries_the_graphs(monkeypatch):
+    """The eager fallback path and the paged one fail independently, so a warmup
+    prefill that raises must not stop the graph capture from being attempted."""
+    from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+
+    seen = []
+    # A bare host: the eager warmup raises on the missing language model, which
+    # is the failure under test, so nothing else may be attached to it.
+    host = object.__new__(SenseNovaU1Pipeline)
+    monkeypatch.setattr(SenseNovaU1Pipeline, "_warm_paged_decode_graphs", lambda self, cache: seen.append(cache))
+    SenseNovaU1Pipeline._warm_ar_decode(host)
+    assert seen == [None], "a failed prefill warmup skipped the graph warmup"
+
+
+@cuda_only
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_serving_below_the_warm_bucket_adds_no_captures(monkeypatch):
+    """The measurable claim of the whole exercise, against a real capture.
+
+    Three requests whose sequences cross the 512 and 1024 boundaries of a
+    lazily-built cache each used to force a grow and a re-capture. From the
+    warm stash they start above both boundaries, so the capture count taken at
+    readiness must be the count after the last one.
+    """
+    dev = torch.device("cuda")
+    pipe_mod, host = _pipeline_host(monkeypatch, device="cuda", language_model=_StubLM(dev))
+
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2, dev))
+    stash = host._paged_decode
+    assert stash[1].captures == 1
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    for prefix, steps in ((300, 1024), (100, 1000), (600, 512)):
+        cache, runner = ctx(host, _dyn_cache(prefix, dev))
+        assert cache is stash[0] and runner is stash[1]
+        target = prefix + steps
+        assert target > BUCKETS[1], "the request never crossed an old bucket boundary"
+        while cache.length < target:
+            if cache.length + 1 > cache.bucket:
+                cache.grow(cache.length + 1)
+            cache.set_length(cache.length + 1)
+            runner.step(0, cache.length - 1)
+        assert runner.captures == 1, f"request with prefix {prefix} captured again"
