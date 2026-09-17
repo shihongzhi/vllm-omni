@@ -51,7 +51,7 @@ from vllm_omni.transformers_utils.configs.sensenova_u1 import (
 )
 
 from .paged_decode import (
-    THINK_REACHABLE_MAX_BUCKET,
+    READINESS_DECODE_WARM_BUCKET,
     DecodeGraphRunner,
     PagedDecodeCache,
     dynamic_lora_wrappers_present,
@@ -747,7 +747,7 @@ class SenseNovaU1Pipeline(
         request and re-captured every time. Reuse rests on the same thing the
         paged path already rests on -- one sequence in flight per pipeline
         forward. The stash may also be the one ``_warm_paged_decode_graphs``
-        built at readiness, already grown to the think-reachable bucket and
+        built at readiness, already grown to ``READINESS_DECODE_WARM_BUCKET`` and
         captured there, in which case serving below that bucket replays without
         capturing at all.
         """
@@ -1301,12 +1301,12 @@ class SenseNovaU1Pipeline(
         self._warm_paged_decode_graphs(prefill_cache)
 
     def _warm_paged_decode_graphs(self, prefill_cache) -> None:
-        """Pre-capture the decode graph at readiness for the think-reachable buckets.
+        """Pre-capture the decode graph at readiness, up to ``READINESS_DECODE_WARM_BUCKET``.
 
         Left lazy, the first think request pays for its own captures -- one per
         bucket boundary its sequence crosses, about 0.7 s across the 512 and
         1024 ones, which medians hide and its P100 carries. A cache pre-grown to
-        ``THINK_REACHABLE_MAX_BUCKET`` ends that: attention reads the live
+        ``READINESS_DECODE_WARM_BUCKET`` ends that: attention reads the live
         ``seqused`` at replay, so the one graph captured against a two-token
         prefix serves every sequence in the bucket, and serving finds the stash
         through ``_decode_context`` without ever growing the cache below that
@@ -1334,7 +1334,7 @@ class SenseNovaU1Pipeline(
                 len(lm.model.layers),
                 device,
                 layer0.keys.dtype,
-                min_length=THINK_REACHABLE_MAX_BUCKET,
+                min_length=READINESS_DECODE_WARM_BUCKET,
             )
             if cache is None:
                 return

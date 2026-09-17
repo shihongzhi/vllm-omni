@@ -53,16 +53,16 @@ BUCKETS = (512, 1024, 2048, 4096, 8192)
 # then reserve 766 MiB it never uses, against 118 MiB here.
 TAIL_STEP = 2048
 
-# The largest bucket a think decode reaches, and therefore the largest one
-# worth capturing at readiness. A think prompt prefixes the sequence by a few
-# hundred tokens and decodes at most `max_think_tokens` (1024) steps, which
-# lands inside 2048; text decode reaches less. A cache pre-grown to this bucket
-# serves every request below it by replay, so the bucket ladder below -- and
-# the ~0.7 s of captures a first think request paid crossing it -- moves to
-# startup. Requests past it (image edits with think, whose image tokens push
-# prefix plus think loop past 2048) still capture lazily on their first
+# The bucket the decode graphs are warmed to at readiness. A cache pre-grown
+# to this bucket serves every request below it by replay, so the bucket ladder
+# below -- and the ~0.7 s of captures a first think request paid crossing it
+# -- moves to startup. 2048 is where a think decode tops out: a think prompt
+# prefixes the sequence by a few hundred tokens and decodes at most
+# `max_think_tokens` (1024) steps, which lands inside it, while text decode
+# reaches less. Requests past it (image edits with think, whose image tokens
+# push prefix plus think loop past 2048) still capture lazily on their first
 # request.
-THINK_REACHABLE_MAX_BUCKET = 2048
+READINESS_DECODE_WARM_BUCKET = 2048
 
 
 # Every argument to the kernel is passed by keyword, so the probe covers all of
@@ -328,7 +328,7 @@ class DecodeGraphRunner:
     The lifecycle is therefore: captured lazily on the first step that needs a
     (bucket, generation), replayed for every later one, orphaned by a realloc,
     and all of it dropped by ``release_captured_graphs`` when sleep discards
-    the memory a capture recorded. ``THINK_REACHABLE_MAX_BUCKET`` moves the
+    the memory a capture recorded. ``READINESS_DECODE_WARM_BUCKET`` moves the
     captures a think request would have paid into startup: the pipeline
     pre-grows the cache and captures there at readiness, so serving below that
     bucket replays and never reallocates.
@@ -372,10 +372,12 @@ class DecodeGraphRunner:
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
             logits = self._forward()
         self.captures += 1
-        # INFO because a capture is a rare, request-visible event: it is the
-        # one thing readiness pre-capture is meant to keep out of serving, so
-        # a line here after the readiness ones is the regression signal.
-        logger.info("Captured decode graph for bucket=%d generation=%d", self.cache.bucket, self.cache.generation)
+        # DEBUG, not INFO: a capture during serving is not by itself a
+        # regression signal -- requests past the warm bucket, dynamic-LoRA
+        # serving and the sleep-level-2 rebuild all capture lazily by design,
+        # and LoRA traffic would drown INFO. The readiness warm logs its own
+        # INFO line.
+        logger.debug("Captured decode graph for bucket=%d generation=%d", self.cache.bucket, self.cache.generation)
         self._graphs[key] = (graph, logits)
         return self._graphs[key]
 
