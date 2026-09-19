@@ -152,11 +152,12 @@ pytest -q tests/diffusion/models/sensenova_u1/
   `flash_attn_varlen_func` cannot support it; set `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` to force
   that fallback.
 - Decode graphs are captured at startup, not per request. The readiness warmup pre-grows the
-  paged cache to the largest bucket a think decode reaches (2048: a think prefix of a few
-  hundred tokens plus the 1024-step think loop) and captures one graph there; think and text
-  requests land inside that bucket and replay it without capturing, across the old 512/1024
-  boundaries. A request past it -- an image edit with think, where image tokens push prefix plus
-  think loop over 2048 -- still captures lazily on its first run, as does the first request after
+  paged cache to a bucket chosen to cover the common text-to-image think path (2048: a think
+  prefix of a few hundred tokens plus the 1024-step think loop) and captures one graph there;
+  think and text requests land inside that bucket and replay it without capturing, across the
+  old 512/1024 boundaries. A request past it -- a long prompt, or an image edit with think,
+  where image tokens push prefix plus think loop over 2048 -- still captures lazily on its
+  first run, as does the first request after
   a sleep-level-2 wake, which drops the captures along with the memory they recorded. Dynamic
   LoRA serving never reuses a capture: a wrapper in the module tree disables the stash for
   every request.

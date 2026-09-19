@@ -1307,8 +1307,9 @@ class SenseNovaU1Pipeline(
         bucket boundary its sequence crosses, about 0.7 s across the 512 and
         1024 ones, which medians hide and its P100 carries. A cache pre-grown to
         ``READINESS_DECODE_WARM_BUCKET`` ends that: attention reads the live
-        ``seqused`` at replay, so the one graph captured against a two-token
-        prefix serves every sequence in the bucket, and serving finds the stash
+        ``seqused`` at replay, so the one graph captured against the synthetic
+        warmup prefix serves every sequence in the bucket, and serving finds
+        the stash
         through ``_decode_context`` without ever growing the cache below that
         bucket. Requests past it, dynamic-LoRA serving and the sleep-level-2
         release all keep today's lazy capture. Best effort, like the warmup

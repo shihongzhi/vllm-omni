@@ -832,7 +832,7 @@ class _CountingRunner:
 def test_readiness_warm_grows_the_stash_to_the_decode_warm_bucket(monkeypatch):
     """One capture at startup has to replace the ones the first requests paid.
 
-    The stash the warmup leaves must be the bucket a think decode tops out at,
+    The stash the warmup leaves must be the decode warm bucket itself,
     not the one its two-token prefill rounds up to -- a cache left at 512 would
     hand the first think request the same grow-and-recapture it was built to
     avoid.
@@ -945,6 +945,7 @@ def test_serving_below_the_warm_bucket_adds_no_captures(monkeypatch):
 
 
 @cuda_only
+@vllm_flash_attn_only
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_sequence_ending_exactly_at_the_warm_bucket_adds_no_capture(monkeypatch):
     """The warm bucket's promise, pinned on the line itself: 2048 still replays.
@@ -972,6 +973,7 @@ def test_a_sequence_ending_exactly_at_the_warm_bucket_adds_no_capture(monkeypatc
 
 
 @cuda_only
+@vllm_flash_attn_only
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_one_step_past_the_warm_bucket_pays_exactly_one_lazy_capture(monkeypatch):
     """The other side of the line: past 2048 the readiness graph stops serving,

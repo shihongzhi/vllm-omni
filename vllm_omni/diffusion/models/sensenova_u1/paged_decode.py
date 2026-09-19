@@ -56,12 +56,12 @@ TAIL_STEP = 2048
 # The bucket the decode graphs are warmed to at readiness. A cache pre-grown
 # to this bucket serves every request below it by replay, so the bucket ladder
 # below -- and the ~0.7 s of captures a first think request paid crossing it
-# -- moves to startup. 2048 is where a think decode tops out: a think prompt
-# prefixes the sequence by a few hundred tokens and decodes at most
-# `max_think_tokens` (1024) steps, which lands inside it, while text decode
-# reaches less. Requests past it (image edits with think, whose image tokens
-# push prefix plus think loop past 2048) still capture lazily on their first
-# request.
+# -- moves to startup. 2048 is chosen to cover the common text-to-image think
+# path: a think prompt prefixes the sequence by a few hundred tokens and
+# decodes at most `max_think_tokens` (1024) steps, which lands inside it,
+# while text decode reaches less. A longer prefix outgrows it -- a long
+# prompt, or an image edit with think, whose image tokens push prefix plus
+# think loop past 2048 -- and still captures lazily on its first request.
 READINESS_DECODE_WARM_BUCKET = 2048
 
 
