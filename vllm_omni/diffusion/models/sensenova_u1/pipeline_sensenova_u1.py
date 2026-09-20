@@ -1471,48 +1471,60 @@ class SenseNovaU1Pipeline(
 
         return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=True)
 
-    def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
-        """Shared denoising loop for both T2I and IT2I."""
+    def _prepare_denoise_step_inputs(self, image_prediction, ns, p, step_i):
+        """Prepare timestep, patchified state, and image embeds for one denoise step."""
         merge_size = self.merge_size
-        image_prediction = ns.image_prediction
 
-        for step_i in range(p.num_steps):
-            t = ns.timesteps[step_i]
-            t_next = ns.timesteps[step_i + 1]
+        t = ns.timesteps[step_i]
+        t_next = ns.timesteps[step_i + 1]
 
-            z = _patchify(image_prediction, self.patch_size * merge_size)
-            image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
-            image_embeds = self._extract_feature(
-                image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
-                gen_model=True,
-                grid_hw=ns.grid_hw,
-            ).view(p.batch_size, ns.token_h * ns.token_w, -1)
+        z = _patchify(image_prediction, self.patch_size * merge_size)
+        image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
+        image_embeds = self._extract_feature(
+            image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
+            gen_model=True,
+            grid_hw=ns.grid_hw,
+        ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
-            t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
-            timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
+        t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
+        timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
+            p.batch_size,
+            ns.token_h * ns.token_w,
+            -1,
+        )
+        if self.model_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
+            ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
                 p.batch_size,
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.model_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
-                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
-                    p.batch_size,
-                    ns.token_h * ns.token_w,
-                    -1,
-                )
-                timestep_embeddings = timestep_embeddings + ns_emb
-            image_embeds = image_embeds + timestep_embeddings
+            timestep_embeddings = timestep_embeddings + ns_emb
+        image_embeds = image_embeds + timestep_embeddings
 
-            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
-            z = z + (t_next - t) * v_pred
-            image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
+        return t, t_next, z, image_embeds
 
-        # Cleanup KV caches
+    def _run_single_denoise_step(self, image_prediction, ns, caches, p, step_i, is_it2i):
+        """Run one denoise forward. Must not mutate ``image_prediction``."""
+        t, t_next, z, image_embeds = self._prepare_denoise_step_inputs(image_prediction, ns, p, step_i)
+
+        v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
+
+        return t, t_next, z, v_pred
+
+    def _apply_denoise_step_update(self, z, t, t_next, v_pred, p):
+        """Apply one flow-matching Euler update and return the next image state."""
+        z = z + (t_next - t) * v_pred
+        return _unpatchify(z, self.patch_size * self.merge_size, p.image_size[1], p.image_size[0])
+
+    def _cleanup_denoise_caches(self, caches):
+        """Release denoising KV caches."""
         for key in ("cond", "uncond", "img_cond"):
             if key in caches and not isinstance(caches[key], dict):
                 clear_flash_kv_cache(caches[key])
 
+    def _build_diffusion_output(self, image_prediction, think_text: str = "") -> DiffusionOutput:
+        """Convert the final image state to a DiffusionOutput."""
         images = _to_pil(image_prediction)
         img = images[0] if images else None
         metadata = {}
@@ -1524,6 +1536,20 @@ class SenseNovaU1Pipeline(
                 "metadata": metadata,
             }
         )
+
+    def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
+        """Shared denoising loop for both T2I and IT2I."""
+        image_prediction = ns.image_prediction
+
+        for step_i in range(p.num_steps):
+            t, t_next, z, v_pred = self._run_single_denoise_step(
+                image_prediction, ns, caches, p, step_i, is_it2i
+            )
+            image_prediction = self._apply_denoise_step_update(z, t, t_next, v_pred, p)
+
+        self._cleanup_denoise_caches(caches)
+
+        return self._build_diffusion_output(image_prediction, think_text)
 
     # -----------------------------------------------------------------------
     # Weight loading
