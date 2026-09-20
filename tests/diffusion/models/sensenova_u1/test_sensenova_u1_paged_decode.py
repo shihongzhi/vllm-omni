@@ -892,8 +892,12 @@ def test_warm_leaves_no_stash_when_it_cannot_be_reused(monkeypatch):
     warm(host, _dyn_cache(2))
     assert getattr(host, "_paged_decode", None) is None, "warm captured across LoRA wrappers"
 
+    # Detach the wrapper first or the LoRA guard shadows the one under test.
+    # Production reaches this guard bare: `_warm_ar_decode` passes None
+    # through whenever the eager warmup above it raises.
+    del host.language_model.q_proj
     warm(host, None)
-    assert getattr(host, "_paged_decode", None) is None
+    assert getattr(host, "_paged_decode", None) is None, "warm captured without a prefill cache"
 
 
 def test_a_failed_prefill_warmup_still_tries_the_graphs(monkeypatch):
