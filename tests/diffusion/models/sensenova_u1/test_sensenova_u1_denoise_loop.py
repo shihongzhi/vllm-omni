@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Behavioral-equivalence tests for the split denoising-loop helpers.
 
-``_run_denoising_loop()`` delegates to ``_run_single_denoise_step()`` /
+``_run_denoising_loop()`` owns a request-local :class:`SenseNovaDenoiseState`
+and delegates to ``_run_single_denoise_step()`` /
 ``_apply_denoise_step_update()`` / ``_cleanup_denoise_caches()`` /
 ``_build_diffusion_output()``. These tests pin the helpers to the
 pre-refactor monolithic loop (kept verbatim below as the reference) by
 running both on identical stubbed inputs and comparing every per-step
-tensor, the final pixels, and the cache cleanup set.
+tensor, the final pixels, and the cache cleanup set — including the
+exception and abort paths.
 """
 
 import types
@@ -18,6 +20,7 @@ import torch
 
 import vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 as pipe_mod
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+    SenseNovaDenoiseState,
     SenseNovaU1Pipeline,
     _patchify,
     _to_pil,
@@ -60,7 +63,7 @@ class _Recorder:
         self.extract_calls.append(image_input.clone())
         return torch.randn(image_input.shape[0], DIM, generator=self.gen)
 
-    def denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def denoise(self, image_prediction, state, t, z, image_embeds, caches, p, step_i, is_it2i):
         self.denoise_calls.append(
             {
                 "image_prediction": image_prediction.clone(),
@@ -88,7 +91,7 @@ def _make_setup():
     )
 
     g = torch.Generator().manual_seed(1234)
-    ns = types.SimpleNamespace(
+    state = SenseNovaDenoiseState(
         image_prediction=torch.randn(BATCH, 3, H, W, generator=g),
         timesteps=1.0 - torch.arange(STEPS + 1, dtype=torch.float32) / STEPS,
         grid_h=GRID,
@@ -97,14 +100,14 @@ def _make_setup():
         token_h=GRID,
         token_w=GRID,
         noise_scale=0.5,
+        caches={
+            "cond": object(),
+            "uncond": object(),
+            "img_cond": {"nested": True},  # dict entries must be skipped by cleanup
+        },
     )
     p = types.SimpleNamespace(batch_size=BATCH, num_steps=STEPS, image_size=[H, W])
-    caches = {
-        "cond": object(),
-        "uncond": object(),
-        "img_cond": {"nested": True},  # dict entries must be skipped by cleanup
-    }
-    return pipe, ns, caches, p
+    return pipe, state, p
 
 
 def _install_recorder(pipe):
@@ -114,9 +117,25 @@ def _install_recorder(pipe):
     return recorder
 
 
-def _reference_denoising_loop(pipe, ns, caches, p, think_text="", is_it2i=False):
-    """The pre-refactor monolithic loop, copied verbatim from the old code."""
+def _reference_denoising_loop(pipe, state, p, think_text="", is_it2i=False):
+    """The pre-refactor monolithic loop, copied verbatim from the old code.
+
+    Reads the same values through the pre-refactor plain-namespace locals
+    (``ns`` / ``caches``) that ``forward()`` used to own.
+    """
     clear_flash_kv_cache = pipe_mod.clear_flash_kv_cache
+
+    ns = types.SimpleNamespace(
+        image_prediction=state.image_prediction,
+        timesteps=state.timesteps,
+        grid_h=state.grid_h,
+        grid_w=state.grid_w,
+        grid_hw=state.grid_hw,
+        token_h=state.token_h,
+        token_w=state.token_w,
+        noise_scale=state.noise_scale,
+    )
+    caches = state.caches
 
     merge_size = pipe.merge_size
     image_prediction = ns.image_prediction
@@ -165,23 +184,23 @@ def _reference_denoising_loop(pipe, ns, caches, p, think_text="", is_it2i=False)
 
 
 def _run_reference(monkeypatch, think_text, is_it2i):
-    pipe, ns, caches, p = _make_setup()
+    pipe, state, p = _make_setup()
     recorder = _install_recorder(pipe)
     monkeypatch.setattr(
         pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache)
     )
-    final_state, images = _reference_denoising_loop(pipe, ns, caches, p, think_text, is_it2i)
-    return recorder, final_state, images, caches
+    final_state, images = _reference_denoising_loop(pipe, state, p, think_text, is_it2i)
+    return recorder, final_state, images, state.caches
 
 
 def _run_current(monkeypatch, think_text, is_it2i):
-    pipe, ns, caches, p = _make_setup()
+    pipe, state, p = _make_setup()
     recorder = _install_recorder(pipe)
     monkeypatch.setattr(
         pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache)
     )
-    output = pipe._run_denoising_loop(ns, caches, p, think_text, is_it2i)
-    return recorder, output, caches
+    output = pipe._run_denoising_loop(state, p, think_text, is_it2i)
+    return recorder, output, state.caches
 
 
 @pytest.mark.parametrize("think_text,is_it2i", [("", False), ("reasoning...", False), ("it2i", True)])
@@ -221,22 +240,92 @@ def test_split_loop_matches_reference(think_text, is_it2i, monkeypatch):
 
 
 def test_single_step_helper_does_not_mutate_image_state():
-    pipe, ns, caches, p = _make_setup()
+    pipe, state, p = _make_setup()
     recorder = _install_recorder(pipe)
 
-    image_before = ns.image_prediction.clone()
-    pipe._run_single_denoise_step(ns.image_prediction, ns, caches, p, 0, is_it2i=False)
+    image_before = state.image_prediction.clone()
+    pipe._run_single_denoise_step(state.image_prediction, state, p, 0, is_it2i=False)
 
-    assert torch.equal(ns.image_prediction, image_before)
+    assert torch.equal(state.image_prediction, image_before)
     assert len(recorder.denoise_calls) == 1
 
 
-def test_cleanup_skips_dict_valued_caches(monkeypatch):
-    pipe, ns, caches, p = _make_setup()
+def test_cleanup_runs_on_exception_path(monkeypatch):
+    pipe, state, p = _make_setup()
+    recorder = _install_recorder(pipe)
+    monkeypatch.setattr(
+        pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache)
+    )
+
+    def failing_denoise(*args, **kwargs):
+        if recorder.denoise_calls:
+            raise RuntimeError("denoise exploded mid-loop")
+        return recorder.denoise(*args, **kwargs)
+
+    pipe._denoise = failing_denoise
+
+    with pytest.raises(RuntimeError, match="denoise exploded"):
+        pipe._run_denoising_loop(state, p, is_it2i=False)
+
+    # Step 0 completed, step 1 raised — caches must still be released.
+    assert len(recorder.denoise_calls) == 1
+    assert recorder.cleaned == [state.caches["cond"], state.caches["uncond"]]
+
+
+def test_cleanup_after_partial_steps_covers_abort_path(monkeypatch):
+    """Abort between steps: the caller holds the request-local state and
+    releases the caches externally, yielding the same release set as normal
+    completion."""
+    pipe, state, p = _make_setup()
+    recorder = _install_recorder(pipe)
     released = []
     monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: released.append(cache))
 
-    pipe._cleanup_denoise_caches(caches)
+    pipe._run_single_denoise_step(state.image_prediction, state, p, 0, is_it2i=False)
+    pipe._cleanup_denoise_caches(state.caches)
+
+    assert len(recorder.denoise_calls) == 1
+    assert released == [state.caches["cond"], state.caches["uncond"]]
+
+
+def test_init_noise_and_schedule_builds_request_state():
+    pipe = object.__new__(SenseNovaU1Pipeline)
+    pipe.patch_size = PATCH
+    pipe.merge_size = MERGE
+    pipe.device = torch.device("cpu")
+    pipe.od_config = types.SimpleNamespace(dtype=torch.float32)
+    pipe.model_cfg = types.SimpleNamespace(
+        noise_scale=1.0,
+        noise_scale_mode=None,
+        noise_scale_max_value=2.0,
+    )
+    p = types.SimpleNamespace(
+        batch_size=BATCH, num_steps=STEPS, image_size=[W, H], seed=7, timestep_shift=3.0
+    )
+
+    state = pipe._init_noise_and_schedule(p)
+
+    assert isinstance(state, SenseNovaDenoiseState)
+    assert state.caches == {}
+    assert state.image_prediction.shape == (BATCH, 3, H, W)
+    assert state.image_prediction.dtype == torch.float32
+    assert state.timesteps.shape == (STEPS + 1,)
+    assert (state.grid_h, state.grid_w) == (GRID, GRID)
+    assert (state.token_h, state.token_w) == (H // (PATCH * MERGE), W // (PATCH * MERGE))
+    assert state.grid_hw.tolist() == [[GRID, GRID]] * BATCH
+    assert state.noise_scale == 1.0
+
+    # Same seed -> identical request-local noise.
+    replay = pipe._init_noise_and_schedule(p)
+    assert torch.equal(state.image_prediction, replay.image_prediction)
+
+
+def test_cleanup_skips_dict_valued_caches(monkeypatch):
+    pipe, state, p = _make_setup()
+    released = []
+    monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: released.append(cache))
+
+    pipe._cleanup_denoise_caches(state.caches)
 
     # "cond" and "uncond" are released; "img_cond" is a dict and must be skipped.
-    assert released == [caches["cond"], caches["uncond"]]
+    assert released == [state.caches["cond"], state.caches["uncond"]]

@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -459,6 +460,46 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.language_model(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Request-local denoising state
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SenseNovaDenoiseState:
+    """Request-local state for one SenseNova-U1.5 denoising run.
+
+    Everything the denoising loop reads or mutates for a request lives here
+    instead of as ``forward()`` locals, so a request can be paused between
+    steps (step execution), resumed, or aborted and cleaned up from outside.
+
+    The field layout mirrors how the state is promoted to the shared
+    step-execution contract: ``image_prediction`` / ``timesteps`` map to
+    ``StepRequestState.latents`` / ``.timesteps``, while the geometry and KV
+    caches stay model-private (``StepRequestState.extra``).
+    """
+
+    # ── Latent state (replaced by every scheduler update) ──
+    image_prediction: torch.Tensor
+
+    # ── Timestep schedule (flow-matching t, [num_steps + 1]) ──
+    timesteps: torch.Tensor
+
+    # ── Request geometry ──
+    grid_h: int
+    grid_w: int
+    token_h: int
+    token_w: int
+    grid_hw: torch.Tensor
+    noise_scale: float
+
+    # ── Denoising KV caches ──
+    # Branch name -> flash KV cache, plus "idx_<branch>" image indexes and
+    # "mask_<branch>" attention masks. Non-dict branch values are released
+    # by ``SenseNovaU1Pipeline._cleanup_denoise_caches``.
+    caches: dict = field(default_factory=dict)
 
 
 class SenseNovaU1Pipeline(
@@ -1073,7 +1114,7 @@ class SenseNovaU1Pipeline(
             query = query.replace("<image>", image_tokens, 1)
         return query
 
-    def _init_noise_and_schedule(self, p):
+    def _init_noise_and_schedule(self, p) -> SenseNovaDenoiseState:
         """Init Gaussian noise and compute the flow-matching timestep schedule."""
         merge_size = self.merge_size
         grid_h = p.image_size[1] // self.patch_size
@@ -1102,8 +1143,7 @@ class SenseNovaU1Pipeline(
         timesteps = torch.linspace(0.0, 1.0, p.num_steps + 1, device=self.device)
         timesteps = self._apply_time_schedule(timesteps, token_h * token_w, p.timestep_shift)
 
-        return SimpleNamespace(
-            merge_size=merge_size,
+        return SenseNovaDenoiseState(
             grid_h=grid_h,
             grid_w=grid_w,
             token_h=token_h,
@@ -1114,7 +1154,9 @@ class SenseNovaU1Pipeline(
             timesteps=timesteps,
         )
 
-    def _get_cfg_kwargs(self, caches: dict, image_embeds, t, z, ns, p, branch: str, cache_dit_skip: bool = False):
+    def _get_cfg_kwargs(self, caches: dict, image_embeds, t, z,
+                        state: SenseNovaDenoiseState, p, branch: str,
+                        cache_dit_skip: bool = False):
         required = (branch, f"idx_{branch}", f"mask_{branch}")
         missing = [key for key in required if key not in caches]
         if missing:
@@ -1126,7 +1168,7 @@ class SenseNovaU1Pipeline(
             attn_mask=caches[f"mask_{branch}"],
             t=t,
             z=z,
-            image_token_num=ns.token_h * ns.token_w,
+            image_token_num=state.token_h * state.token_w,
             image_size=p.image_size,
             t_eps=p.t_eps,
         )
@@ -1134,18 +1176,18 @@ class SenseNovaU1Pipeline(
             kwargs["cache_dit_skip"] = True
         return kwargs
 
-    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def _denoise(self, image_prediction, state: SenseNovaDenoiseState, t, z, image_embeds, caches, p, step_i, is_it2i):
         if not is_it2i:
             has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, state, p, branch="cond", cache_dit_skip=not has_cached_partner
             )
 
             in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
             if not (in_interval and p.cfg_scale > 1):
                 return self.predict_noise(**cond_kwargs)
 
-            uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
+            uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, state, p, branch="uncond")
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=True,
                 true_cfg_scale=p.cfg_scale,
@@ -1160,7 +1202,7 @@ class SenseNovaU1Pipeline(
             needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
             has_cached_partner = use_cfg and needs_cfg
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, state, p, branch="cond", cache_dit_skip=not has_cached_partner
             )
 
             if not use_cfg or not needs_cfg:
@@ -1168,7 +1210,7 @@ class SenseNovaU1Pipeline(
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
             if p.img_cfg_scale == 1:
-                image_cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="img_cond")
+                image_cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, state, p, branch="img_cond")
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=True,
                     true_cfg_scale=p.cfg_scale,
@@ -1178,7 +1220,7 @@ class SenseNovaU1Pipeline(
                     kwargs={"is_it2i": is_it2i},
                 )
             elif p.cfg_scale == p.img_cfg_scale:
-                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
+                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, state, p, branch="uncond")
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=True,
                     true_cfg_scale=p.cfg_scale,
@@ -1189,9 +1231,9 @@ class SenseNovaU1Pipeline(
                 )
             else:
                 image_cond_kwargs = self._get_cfg_kwargs(
-                    caches, image_embeds, t, z, ns, p, branch="img_cond", cache_dit_skip=True
+                    caches, image_embeds, t, z, state, p, branch="img_cond", cache_dit_skip=True
                 )
-                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
+                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, state, p, branch="uncond")
                 noise_pred = self.predict_noise_with_multi_branch_cfg(
                     do_true_cfg=True,
                     true_cfg_scale={
@@ -1311,7 +1353,7 @@ class SenseNovaU1Pipeline(
 
     def _forward_t2i(self, p) -> DiffusionOutput:
         """Text-to-image generation path."""
-        ns = self._init_noise_and_schedule(p)
+        state = self._init_noise_and_schedule(p)
 
         think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
         query_cond = _build_t2i_query(p.prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
@@ -1320,9 +1362,11 @@ class SenseNovaU1Pipeline(
         input_ids_cond, indexes_cond, mask_cond = self._build_t2i_text_inputs(query_cond)
         input_ids_uncond, indexes_uncond, mask_uncond = self._build_t2i_text_inputs(query_uncond)
 
-        indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, indexes_cond.shape[1], self.device)
+        indexes_image_cond = self._build_t2i_image_indexes(
+            state.token_h, state.token_w, indexes_cond.shape[1], self.device
+        )
         indexes_image_uncond = self._build_t2i_image_indexes(
-            ns.token_h, ns.token_w, indexes_uncond.shape[1], self.device
+            state.token_h, state.token_w, indexes_uncond.shape[1], self.device
         )
 
         think_text = ""
@@ -1336,16 +1380,18 @@ class SenseNovaU1Pipeline(
             past_kv_cond = outputs_cond.past_key_values
             t_index_cond = indexes_cond[0].max().item()
             past_kv_cond, t_index_cond, think_text = self._generate_think(outputs_cond, past_kv_cond, t_index_cond)
-            indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, t_index_cond + 1, self.device)
+            indexes_image_cond = self._build_t2i_image_indexes(
+                state.token_h, state.token_w, t_index_cond + 1, self.device
+            )
         else:
             past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
 
         past_kv_uncond, _ = self._t2i_prefix_forward(input_ids_uncond, indexes_uncond, mask_uncond)
 
-        self._expand_and_prepare_kv(past_kv_cond, ns.token_h * ns.token_w, p.batch_size)
-        self._expand_and_prepare_kv(past_kv_uncond, ns.token_h * ns.token_w, p.batch_size)
+        self._expand_and_prepare_kv(past_kv_cond, state.token_h * state.token_w, p.batch_size)
+        self._expand_and_prepare_kv(past_kv_uncond, state.token_h * state.token_w, p.batch_size)
 
-        caches = {
+        state.caches = {
             "cond": past_kv_cond,
             "idx_cond": indexes_image_cond,
             "mask_cond": {"full_attention": None},
@@ -1353,11 +1399,11 @@ class SenseNovaU1Pipeline(
             "idx_uncond": indexes_image_uncond,
             "mask_uncond": {"full_attention": None},
         }
-        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=False)
+        return self._run_denoising_loop(state, p, think_text, is_it2i=False)
 
     def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
         """Image-to-image (editing) generation path with dual CFG."""
-        ns = self._init_noise_and_schedule(p)
+        state = self._init_noise_and_schedule(p)
 
         pixel_values, grid_hw = self._prepare_input_images(input_images)
         images_info = {"grid_hw": grid_hw, "pixel_values": pixel_values}
@@ -1413,31 +1459,30 @@ class SenseNovaU1Pipeline(
                 t_index_cond,
             )
             idx_image_cond = self._build_t2i_image_indexes(
-                ns.token_h,
-                ns.token_w,
+                state.token_h,
+                state.token_w,
                 t_index_cond + 1,
                 self.device,
             )
         else:
             past_kv_cond, _ = self._it2i_prefix_forward(embeds_cond, idx_cond, mask_cond)
             idx_image_cond = self._build_t2i_image_indexes(
-                ns.token_h,
-                ns.token_w,
+                state.token_h,
+                state.token_w,
                 idx_cond[0].max().item() + 1,
                 self.device,
             )
 
-        caches = {
-            "cond": past_kv_cond,
-            "idx_cond": idx_image_cond,
-            "mask_cond": {"full_attention": None},
-        }
+        caches = state.caches
+        caches["cond"] = past_kv_cond
+        caches["idx_cond"] = idx_image_cond
+        caches["mask_cond"] = {"full_attention": None}
 
         if needs_img_cond:
             past_kv_img_cond, _ = self._it2i_prefix_forward(embeds_img_cond, idx_img_cond, mask_img_cond)
             idx_image_img_cond = self._build_t2i_image_indexes(
-                ns.token_h,
-                ns.token_w,
+                state.token_h,
+                state.token_w,
                 idx_img_cond[0].max().item() + 1,
                 self.device,
             )
@@ -1448,8 +1493,8 @@ class SenseNovaU1Pipeline(
         if needs_uncond:
             past_kv_uncond, _ = self._it2i_prefix_forward(embeds_uncond, idx_uncond, mask_uncond)
             idx_image_uncond = self._build_t2i_image_indexes(
-                ns.token_h,
-                ns.token_w,
+                state.token_h,
+                state.token_w,
                 idx_uncond[0].max().item() + 1,
                 self.device,
             )
@@ -1467,36 +1512,36 @@ class SenseNovaU1Pipeline(
         # Expand all KV caches for batch
         for key in ("cond", "img_cond", "uncond"):
             if key in caches and not isinstance(caches[key], dict):
-                self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
+                self._expand_and_prepare_kv(caches[key], state.token_h * state.token_w, p.batch_size)
 
-        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=True)
+        return self._run_denoising_loop(state, p, think_text, is_it2i=True)
 
-    def _prepare_denoise_step_inputs(self, image_prediction, ns, p, step_i):
+    def _prepare_denoise_step_inputs(self, image_prediction, state: SenseNovaDenoiseState, p, step_i):
         """Prepare timestep, patchified state, and image embeds for one denoise step."""
         merge_size = self.merge_size
 
-        t = ns.timesteps[step_i]
-        t_next = ns.timesteps[step_i + 1]
+        t = state.timesteps[step_i]
+        t_next = state.timesteps[step_i + 1]
 
         z = _patchify(image_prediction, self.patch_size * merge_size)
         image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
         image_embeds = self._extract_feature(
-            image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
+            image_input.view(p.batch_size * state.grid_h * state.grid_w, -1),
             gen_model=True,
-            grid_hw=ns.grid_hw,
-        ).view(p.batch_size, ns.token_h * ns.token_w, -1)
+            grid_hw=state.grid_hw,
+        ).view(p.batch_size, state.token_h * state.token_w, -1)
 
-        t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
+        t_expanded = t.expand(p.batch_size * state.token_h * state.token_w)
         timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
             p.batch_size,
-            ns.token_h * ns.token_w,
+            state.token_h * state.token_w,
             -1,
         )
         if self.model_cfg.add_noise_scale_embedding:
-            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
+            ns_tensor = torch.full_like(t_expanded, state.noise_scale / self.model_cfg.noise_scale_max_value)
             ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
                 p.batch_size,
-                ns.token_h * ns.token_w,
+                state.token_h * state.token_w,
                 -1,
             )
             timestep_embeddings = timestep_embeddings + ns_emb
@@ -1504,11 +1549,13 @@ class SenseNovaU1Pipeline(
 
         return t, t_next, z, image_embeds
 
-    def _run_single_denoise_step(self, image_prediction, ns, caches, p, step_i, is_it2i):
+    def _run_single_denoise_step(
+        self, image_prediction, state: SenseNovaDenoiseState, p, step_i, is_it2i
+    ):
         """Run one denoise forward. Must not mutate ``image_prediction``."""
-        t, t_next, z, image_embeds = self._prepare_denoise_step_inputs(image_prediction, ns, p, step_i)
+        t, t_next, z, image_embeds = self._prepare_denoise_step_inputs(image_prediction, state, p, step_i)
 
-        v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
+        v_pred = self._denoise(image_prediction, state, t, z, image_embeds, state.caches, p, step_i, is_it2i)
 
         return t, t_next, z, v_pred
 
@@ -1537,19 +1584,25 @@ class SenseNovaU1Pipeline(
             }
         )
 
-    def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
-        """Shared denoising loop for both T2I and IT2I."""
-        image_prediction = ns.image_prediction
+    def _run_denoising_loop(
+        self, state: SenseNovaDenoiseState, p, think_text: str = "", is_it2i: bool = False
+    ) -> DiffusionOutput:
+        """Shared denoising loop for both T2I and IT2I.
 
-        for step_i in range(p.num_steps):
-            t, t_next, z, v_pred = self._run_single_denoise_step(
-                image_prediction, ns, caches, p, step_i, is_it2i
-            )
-            image_prediction = self._apply_denoise_step_update(z, t, t_next, v_pred, p)
+        Cleanup runs from a ``finally`` block so the denoising caches are
+        released on normal completion, on abort (caller-driven, via the
+        request-local state), and on exception paths alike.
+        """
+        try:
+            for step_i in range(p.num_steps):
+                t, t_next, z, v_pred = self._run_single_denoise_step(
+                    state.image_prediction, state, p, step_i, is_it2i
+                )
+                state.image_prediction = self._apply_denoise_step_update(z, t, t_next, v_pred, p)
+        finally:
+            self._cleanup_denoise_caches(state.caches)
 
-        self._cleanup_denoise_caches(caches)
-
-        return self._build_diffusion_output(image_prediction, think_text)
+        return self._build_diffusion_output(state.image_prediction, think_text)
 
     # -----------------------------------------------------------------------
     # Weight loading
