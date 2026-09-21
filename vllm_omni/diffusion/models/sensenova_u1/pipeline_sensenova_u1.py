@@ -22,7 +22,7 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -64,6 +64,12 @@ from .sensenova_u1_transformer import (
     create_block_causal_mask,
     prepare_flash_kv_cache,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = init_logger(__name__)
 
@@ -419,6 +425,24 @@ def get_sensenova_u1_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
+    """Route text-only chat requests away from step execution.
+
+    Text-modality requests run a full AR decode (``_forward_text``) that has no
+    denoise steps, so they must use the non-step fallback even when the engine
+    runs in step mode. Mirrors the Bagel text-request routing.
+    """
+
+    def pre_process_func(request):
+        if bool(getattr(od_config, "step_execution", False)) and isinstance(request.prompt, dict):
+            modalities = request.prompt.get("modalities") or []
+            if "text" in modalities:
+                request.use_step_execution = False
+        return request
+
+    return pre_process_func
+
+
 # ---------------------------------------------------------------------------
 # CFG helpers
 # ---------------------------------------------------------------------------
@@ -466,6 +490,15 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
 # Request-local denoising state
 # ---------------------------------------------------------------------------
 
+# StepRequestState.extra keys for step execution. The request-local denoising
+# state keeps the full flow-matching schedule ([num_steps + 1] entries) and the
+# per-request KV caches; StepRequestState.latents / .timesteps carry the
+# canonical image prediction and the per-step t values respectively.
+_STEP_DENOISE_STATE = "sensenova_denoise_state"
+_STEP_PARAMS = "sensenova_params"
+_STEP_THINK_TEXT = "sensenova_think_text"
+_STEP_IS_IT2I = "sensenova_is_it2i"
+
 
 @dataclass
 class SenseNovaDenoiseState:
@@ -479,6 +512,11 @@ class SenseNovaDenoiseState:
     step-execution contract: ``image_prediction`` / ``timesteps`` map to
     ``StepRequestState.latents`` / ``.timesteps``, while the geometry and KV
     caches stay model-private (``StepRequestState.extra``).
+
+    In step-execution mode ``StepRequestState.latents`` is the authoritative
+    image prediction (the runner scatters updates into it), so the
+    ``image_prediction`` field is not kept synchronized there; the step
+    helpers read the prediction as their leading argument instead.
     """
 
     # ── Latent state (replaced by every scheduler update) ──
@@ -535,6 +573,11 @@ class SenseNovaU1Pipeline(
     # Top-level module(s) the diffusion LoRA manager scans (both MoT branches).
     # TODO: promote to a shared LoRA contract/mixin instead of per-pipeline opt-in.
     _lora_components: ClassVar[list[str]] = ["language_model"]
+
+    # SupportsStepExecution: forward() is split into prepare_encode /
+    # denoise_step / step_scheduler / post_decode so the runner can drive the
+    # denoise loop one step at a time and interleave work between steps.
+    supports_step_execution: ClassVar[bool] = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -1016,13 +1059,16 @@ class SenseNovaU1Pipeline(
     # Main forward (T2I / IT2I / T2T / I2T)
     # -----------------------------------------------------------------------
 
-    def _parse_request(self, req: OmniDiffusionRequest):
-        """Extract common parameters from the request."""
-        first_prompt = req.prompts[0]
+    def _parse_prompt_and_params(self, first_prompt, sampling_params):
+        """Parse request params from one prompt and its sampling params.
+
+        Shared by ``forward()`` (from a ``DiffusionRequestBatch`` member) and
+        ``prepare_encode()`` (from a ``StepRequestState``).
+        """
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
-        height = int(req.sampling_params.height) if req.sampling_params.height else 2048
-        width = int(req.sampling_params.width) if req.sampling_params.width else 2048
+        extra_args = getattr(sampling_params, "extra_args", {}) or {}
+        height = int(sampling_params.height) if sampling_params.height else 2048
+        width = int(sampling_params.width) if sampling_params.width else 2048
         grid_factor = self.patch_size * self.merge_size
         if height % grid_factor or width % grid_factor:
             old_h, old_w = height, width
@@ -1041,17 +1087,21 @@ class SenseNovaU1Pipeline(
             prompt=prompt,
             extra_args=extra_args,
             image_size=(width, height),
-            num_steps=int(req.sampling_params.num_inference_steps or 50),
+            num_steps=int(sampling_params.num_inference_steps or 50),
             cfg_scale=float(extra_args.get("cfg_scale", 4.0)),
             img_cfg_scale=float(extra_args.get("img_cfg_scale", 1.0)),
             cfg_norm=str(extra_args.get("cfg_norm", "none")),
             timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
             cfg_interval=tuple(extra_args.get("cfg_interval", (0.0, 1.0))),
             batch_size=int(extra_args.get("batch_size", 1)),
-            seed=int(req.sampling_params.seed) if req.sampling_params.seed is not None else 42,
+            seed=int(sampling_params.seed) if sampling_params.seed is not None else 42,
             think_mode=bool(extra_args.get("think", False)),
             t_eps=float(extra_args.get("t_eps", 0.02)),
         )
+
+    def _parse_request(self, req: OmniDiffusionRequest):
+        """Extract common parameters from the request."""
+        return self._parse_prompt_and_params(req.prompts[0], req.sampling_params)
 
     def _extract_input_images(self, first_prompt):
         """Return a list of PIL images from ``multi_modal_data``, or *None*."""
@@ -1351,8 +1401,8 @@ class SenseNovaU1Pipeline(
             return self._forward_it2i(p, input_images)
         return self._forward_t2i(p)
 
-    def _forward_t2i(self, p) -> DiffusionOutput:
-        """Text-to-image generation path."""
+    def _prepare_t2i(self, p) -> tuple[SenseNovaDenoiseState, str]:
+        """One-time T2I request setup: text prefix, KV caches, think decode."""
         state = self._init_noise_and_schedule(p)
 
         think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -1399,10 +1449,15 @@ class SenseNovaU1Pipeline(
             "idx_uncond": indexes_image_uncond,
             "mask_uncond": {"full_attention": None},
         }
+        return state, think_text
+
+    def _forward_t2i(self, p) -> DiffusionOutput:
+        """Text-to-image generation path."""
+        state, think_text = self._prepare_t2i(p)
         return self._run_denoising_loop(state, p, think_text, is_it2i=False)
 
-    def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
-        """Image-to-image (editing) generation path with dual CFG."""
+    def _prepare_it2i(self, p, input_images: list[Image.Image]) -> tuple[SenseNovaDenoiseState, str]:
+        """One-time IT2I request setup: dual-CFG prefixes and KV caches."""
         state = self._init_noise_and_schedule(p)
 
         pixel_values, grid_hw = self._prepare_input_images(input_images)
@@ -1514,6 +1569,11 @@ class SenseNovaU1Pipeline(
             if key in caches and not isinstance(caches[key], dict):
                 self._expand_and_prepare_kv(caches[key], state.token_h * state.token_w, p.batch_size)
 
+        return state, think_text
+
+    def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
+        """Image-to-image (editing) generation path with dual CFG."""
+        state, think_text = self._prepare_it2i(p, input_images)
         return self._run_denoising_loop(state, p, think_text, is_it2i=True)
 
     def _prepare_denoise_step_inputs(self, image_prediction, state: SenseNovaDenoiseState, p, step_i):
@@ -1603,6 +1663,102 @@ class SenseNovaU1Pipeline(
             self._cleanup_denoise_caches(state.caches)
 
         return self._build_diffusion_output(state.image_prediction, think_text)
+
+    # -----------------------------------------------------------------------
+    # Step execution (SupportsStepExecution)
+    # -----------------------------------------------------------------------
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """One-time request setup for step-driven execution.
+
+        Runs everything ``forward()`` does before the denoise loop (text/vision
+        prefixes, think AR decode, KV caches, noise and schedule) and parks the
+        result on the runner-owned state: the canonical image prediction in
+        ``state.latents``, the per-step t values in ``state.timesteps``, and
+        model-private state under ``state.extra``.
+        """
+        del kwargs
+        p = self._parse_prompt_and_params(state.prompt, state.sampling)
+        modalities = state.prompt.get("modalities", []) if isinstance(state.prompt, dict) else []
+        if "text" in modalities:
+            raise ValueError(
+                "SenseNova step execution cannot run text-only requests; they are routed to the "
+                "full forward path by the pre-process func (use_step_execution=False)."
+            )
+
+        input_images = self._extract_input_images(state.prompt)
+        if input_images is not None:
+            sn_state, think_text = self._prepare_it2i(p, input_images)
+            is_it2i = True
+        else:
+            sn_state, think_text = self._prepare_t2i(p)
+            is_it2i = False
+
+        state.latents = sn_state.image_prediction
+        # The runner derives total_steps/current_timestep from state.timesteps,
+        # so it must hold exactly num_steps entries; the final schedule entry
+        # is only consumed as t_next by the scheduler update and stays on the
+        # request-local state (sn_state.timesteps keeps the full table).
+        state.timesteps = sn_state.timesteps[:-1]
+        state.step_index = 0
+        state.extra[_STEP_DENOISE_STATE] = sn_state
+        state.extra[_STEP_PARAMS] = p
+        state.extra[_STEP_THINK_TEXT] = think_text
+        state.extra[_STEP_IS_IT2I] = is_it2i
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run one denoise forward per request and concatenate on the batch dim.
+
+        The step forward is request-local (flash KV caches and geometry live on
+        each state), so the runner-assembled ``input_batch`` only provides the
+        selected states. Its rows concatenate to the layout ``step_scheduler``
+        consumes: one slice of ``latents.shape[0]`` rows per request.
+        """
+        del kwargs
+        selected = states if states is not None else input_batch.states
+        v_preds = []
+        for req in selected:
+            _, _, _, v_pred = self._run_single_denoise_step(
+                req.latents,
+                req.extra[_STEP_DENOISE_STATE],
+                req.extra[_STEP_PARAMS],
+                req.step_index,
+                req.extra[_STEP_IS_IT2I],
+            )
+            v_preds.append(v_pred)
+        if len(v_preds) == 1:
+            return v_preds[0]
+        return torch.cat(v_preds, dim=0)
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        """Apply one flow-matching Euler update to the canonical image prediction."""
+        del kwargs
+        if noise_pred is None:
+            return
+        sn_state = state.extra[_STEP_DENOISE_STATE]
+        p = state.extra[_STEP_PARAMS]
+        t, t_next = sn_state.timesteps[state.step_index], sn_state.timesteps[state.step_index + 1]
+        z = _patchify(state.latents, self.patch_size * self.merge_size)
+        state.latents = self._apply_denoise_step_update(z, t, t_next, noise_pred, p)
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Decode the final image prediction and release the denoising caches."""
+        del kwargs
+        think_text = state.extra.get(_STEP_THINK_TEXT, "")
+        try:
+            return self._build_diffusion_output(state.latents, think_text)
+        finally:
+            sn_state = state.extra.get(_STEP_DENOISE_STATE)
+            if sn_state is not None:
+                self._cleanup_denoise_caches(sn_state.caches)
 
     # -----------------------------------------------------------------------
     # Weight loading

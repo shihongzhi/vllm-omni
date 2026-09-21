@@ -686,6 +686,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_pre_process_func",
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
