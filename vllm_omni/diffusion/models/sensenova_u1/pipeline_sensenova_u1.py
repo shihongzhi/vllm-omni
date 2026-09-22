@@ -43,7 +43,10 @@ from vllm_omni.diffusion.lora.loader import (
     _remap_state_dict_keys,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import (
+    SupportsComponentDiscovery,
+    SupportsStepStateRelease,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -543,6 +546,7 @@ class SenseNovaDenoiseState:
 class SenseNovaU1Pipeline(
     nn.Module,
     SupportsComponentDiscovery,
+    SupportsStepStateRelease,
     DiffusionPipelineProfilerMixin,
     CFGParallelMixin,
     LoraLoaderMixin,
@@ -1767,6 +1771,24 @@ class SenseNovaU1Pipeline(
         state.latents = self._apply_denoise_step_update(z, t, t_next, noise_pred, p)
         state.step_index += 1
 
+    def release_step_state(self, state: StepRequestState, *, aborted: bool = False) -> None:
+        """Release the request-local denoising KV caches (SupportsStepStateRelease).
+
+        The flash KV cache tensors are attached to the transformer layers as
+        attributes, so they survive garbage collection of the runner state;
+        this hook lets the runner free them at every retirement point (abort,
+        interrupt, per-request failure, and normal completion after
+        ``post_decode``). Emptying ``caches`` makes a repeat release a no-op,
+        which the runner relies on: normal completion releases once in
+        ``post_decode`` and again from the retirement hook.
+        """
+        del aborted
+        sn_state = state.extra.get(_STEP_DENOISE_STATE)
+        if sn_state is None:
+            return
+        self._cleanup_denoise_caches(sn_state.caches)
+        sn_state.caches.clear()
+
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Decode the final image prediction and release the denoising caches."""
         del kwargs
@@ -1774,9 +1796,7 @@ class SenseNovaU1Pipeline(
         try:
             return self._build_diffusion_output(state.latents, think_text)
         finally:
-            sn_state = state.extra.get(_STEP_DENOISE_STATE)
-            if sn_state is not None:
-                self._cleanup_denoise_caches(sn_state.caches)
+            self.release_step_state(state)
 
     # -----------------------------------------------------------------------
     # Weight loading

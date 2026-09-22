@@ -28,6 +28,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 as pipe_mod
+from vllm_omni.diffusion.models.interface import release_step_state_if_supported
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
     _STEP_DENOISE_STATE,
     _STEP_IS_IT2I,
@@ -226,6 +227,9 @@ def test_step_batch_matches_sequential_execution(monkeypatch):
     _, sn_b, p_b = _make_setup(seed=5678)
     recorder = _install_recorder(pipe)
     _track_cleanup(monkeypatch, recorder)
+    # Cache references must be captured before any release clears the dicts.
+    cond_a, uncond_a = sn_a.caches["cond"], sn_a.caches["uncond"]
+    cond_b, uncond_b = sn_b.caches["cond"], sn_b.caches["uncond"]
     req_a = _build_step_request(sn_a, p_a, request_id="req-a")
     req_b = _build_step_request(sn_b, p_b, request_id="req-b")
 
@@ -241,10 +245,7 @@ def test_step_batch_matches_sequential_execution(monkeypatch):
         assert np.array_equal(np.asarray(batch_img), np.asarray(solo_img))
 
     # Each request's caches were released exactly once, in decode order.
-    assert recorder.cleaned == [
-        sn_a.caches["cond"], sn_a.caches["uncond"],
-        sn_b.caches["cond"], sn_b.caches["uncond"],
-    ]
+    assert recorder.cleaned == [cond_a, uncond_a, cond_b, uncond_b]
 
 
 def test_step_batch_mixed_t2i_and_it2i_requests(monkeypatch):
@@ -254,6 +255,8 @@ def test_step_batch_mixed_t2i_and_it2i_requests(monkeypatch):
     _, sn_it2i, _ = _make_setup(seed=5678)
     recorder = _install_recorder(pipe)
     _track_cleanup(monkeypatch, recorder)
+    cond_t2i = sn_t2i.caches["cond"]
+    cond_it2i = sn_it2i.caches["cond"]
     req_t2i = _build_step_request(sn_t2i, p, request_id="req-t2i", is_it2i=False)
     req_it2i = _build_step_request(sn_it2i, p, request_id="req-it2i", is_it2i=True)
 
@@ -266,8 +269,8 @@ def test_step_batch_mixed_t2i_and_it2i_requests(monkeypatch):
     assert outputs["req-t2i"].output["payload"]["image"] is not None
     assert outputs["req-it2i"].output["payload"]["image"] is not None
     # Both requests released their non-dict caches (img_cond dict is skipped).
-    assert recorder.cleaned.count(sn_t2i.caches["cond"]) == 1
-    assert recorder.cleaned.count(sn_it2i.caches["cond"]) == 1
+    assert recorder.cleaned.count(cond_t2i) == 1
+    assert recorder.cleaned.count(cond_it2i) == 1
 
 
 def test_step_batch_unequal_step_counts(monkeypatch):
@@ -341,9 +344,10 @@ def test_mid_flight_admission_continues_older_request(monkeypatch):
 def test_aborted_request_peer_unaffected(monkeypatch):
     """Aborting one request mid-denoise releases its caches and spares peers.
 
-    The abort takes effect at a wave boundary (the runner pops the state when
-    the next wave assembles); the cancelled request's caches are released via
-    the caller-side cleanup the request-local state supports, and the wave
+    The abort takes effect at a wave boundary: the runner retires the state
+    when the next wave assembles and releases the cancelled request's caches
+    through the step-state release hook (the idempotent release post_decode
+    runs on the completion path, which this request never reaches). The wave
     peer keeps evolving exactly as a solo run.
     """
     solo_calls, solo_out, _ = _solo_run(monkeypatch, seed=1234, request_id="req-a")
@@ -352,16 +356,24 @@ def test_aborted_request_peer_unaffected(monkeypatch):
     _, sn_b, p_b = _make_setup(seed=5678)
     recorder = _install_recorder(pipe)
     _track_cleanup(monkeypatch, recorder)
+    cond_a = sn_a.caches["cond"]
+    cond_b = sn_b.caches["cond"]
+    uncond_b = sn_b.caches["uncond"]
     req_a = _build_step_request(sn_a, p_a, request_id="req-a")
     req_b = _build_step_request(sn_b, p_b, request_id="req-b")
 
     _drive_wave(pipe, [req_a, req_b])
 
-    # Cancel req-b between waves: the runner drops its state; the request-local
-    # caches are released from the caller side (idempotent with post_decode's
-    # finally path, which this request never reaches).
-    pipe._cleanup_denoise_caches(sn_b.caches)
-    assert recorder.cleaned == [sn_b.caches["cond"], sn_b.caches["uncond"]]
+    # Cancel req-b between waves: the runner pops its state and calls the
+    # pipeline release hook with aborted=True, the way
+    # _cleanup_finished_step_requests does.
+    release_step_state_if_supported(pipe, req_b, aborted=True)
+    assert recorder.cleaned == [cond_b, uncond_b]
+    # The release is idempotent: the runner may call it again at retirement
+    # after another path (here, a deliberate repeat) already released.
+    assert not sn_b.caches
+    release_step_state_if_supported(pipe, req_b, aborted=True)
+    assert recorder.cleaned == [cond_b, uncond_b]
 
     while not req_a.denoise_completed:
         _drive_wave(pipe, [req_a])
@@ -375,8 +387,8 @@ def test_aborted_request_peer_unaffected(monkeypatch):
     solo_img = solo_out.output["payload"]["image"]
     assert np.array_equal(np.asarray(out_a.output["payload"]["image"]), np.asarray(solo_img))
     # Peer caches released once; the aborted request's release is unchanged.
-    assert recorder.cleaned.count(sn_a.caches["cond"]) == 1
-    assert recorder.cleaned.count(sn_b.caches["cond"]) == 1
+    assert recorder.cleaned.count(cond_a) == 1
+    assert recorder.cleaned.count(cond_b) == 1
 
 
 def test_step_batch_noise_is_per_request():

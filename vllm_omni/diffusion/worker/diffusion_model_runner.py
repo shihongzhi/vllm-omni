@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
+    release_step_state_if_supported,
     supports_interaction_apply,
     supports_step_execution,
 )
@@ -1018,7 +1019,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids
         for request_id in finished_req_ids:
-            self.state_cache.pop(request_id, None)
+            state = self.state_cache.pop(request_id, None)
+            if state is not None:
+                # A state still cached here was retired without a completed
+                # decode (abort or fallback-wave cleanup); give the pipeline a
+                # chance to free request-scoped resources the pop drops.
+                release_step_state_if_supported(self.pipeline, state, aborted=True)
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1094,6 +1100,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 # peers then hang on the NCCL collective until timeout.
                 def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
                     self.state_cache.pop(state.request_id, None)
+                    # prepare_encode may have already parked native resources
+                    # on the state (or succeeded here while another DiT rank
+                    # failed); release before the state is dropped.
+                    release_step_state_if_supported(pipeline, state, aborted=True)
                     if per_req_exc is None:
                         per_req_exc = RuntimeError(
                             f"Stepwise preparation failed on another DiT rank for {state.request_id}"
@@ -1182,6 +1192,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         for state in states:
             if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
+                # Normal completion already released via post_decode's finally
+                # (the hook is idempotent); interrupts retire mid-denoise state
+                # whose resources only the pipeline can free.
+                release_step_state_if_supported(self.pipeline, state, aborted=interrupted)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1399,6 +1413,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         except Exception as per_req_exc:
                             offset = offset + row_num
                             self.state_cache.pop(req.request_id, None)
+                            release_step_state_if_supported(pipeline, req, aborted=True)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,

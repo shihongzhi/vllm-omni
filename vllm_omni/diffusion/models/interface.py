@@ -123,6 +123,45 @@ class SupportsStepExecution(Protocol):
 
 
 @runtime_checkable
+class SupportsStepStateRelease(Protocol):
+    """Optional step-execution release hook for request-scoped resources.
+
+    A step pipeline may park native resources on ``state.extra`` that outlive
+    the runner state itself — for example KV cache tensors attached as
+    attributes to persistent layers. Dropping the runner state then does not
+    free those tensors, so the runner offers this hook at every step-request
+    retirement point: abort (scheduler-driven), interrupt, per-request
+    failure, and normal completion after ``post_decode``.
+
+    Implementations must be idempotent: the runner may release a state whose
+    ``post_decode`` already released it. This is a separate optional protocol
+    rather than a member of ``SupportsStepExecution`` so pipelines without
+    native per-request resources keep passing the step-execution check.
+    """
+
+    def release_step_state(self, state: StepRequestState, *, aborted: bool = False) -> None:
+        """Release request-scoped step resources.
+
+        ``aborted`` is ``True`` when the request retires without a completed
+        decode (abort, interrupt, or failure) and ``False`` on the normal
+        completion path.
+        """
+        ...
+
+
+def release_step_state_if_supported(
+    pipeline: object,
+    state: StepRequestState,
+    *,
+    aborted: bool = False,
+) -> None:
+    """Invoke the optional step-state release hook when the pipeline provides it."""
+
+    if isinstance(pipeline, SupportsStepStateRelease):
+        pipeline.release_step_state(state, aborted=aborted)
+
+
+@runtime_checkable
 class SupportsComponentDiscovery(Protocol):
     """Declares which submodules serve as pipeline components.
 

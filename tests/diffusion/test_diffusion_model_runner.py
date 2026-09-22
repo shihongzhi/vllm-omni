@@ -25,6 +25,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -353,6 +354,61 @@ def test_execute_stepwise_falls_back_to_full_forward_without_creating_step_state
     assert output.result.output == request.prompt
     assert isinstance(runner.pipeline.last_req, DiffusionRequestBatch)
     assert runner.pipeline.last_req.num_reqs == 1
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_cleanup_finished_step_requests_releases_pipeline_step_state():
+    """An aborted step request must reach the pipeline release hook.
+
+    ``state_cache.pop`` alone drops the runner state, but step pipelines may
+    park request-scoped resources on persistent modules (e.g. SenseNova-U1.5
+    attaches flash KV cache tensors to transformer layers). Without the hook
+    the abort path would leak them until an unrelated request happens to
+    overwrite the layer attributes. Requests whose state was already retired
+    (normal completion pops in ``_update_states_after``) release nothing.
+    """
+    released = []
+
+    class _ReleasingStepPipeline(_FinalOnlyStepPipeline):
+        def release_step_state(self, state, *, aborted=False):
+            released.append((state.request_id, aborted))
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _ReleasingStepPipeline()
+    aborted_state = StepRequestState(
+        request_id="aborted-step-request",
+        sampling=OmniDiffusionSamplingParams(num_inference_steps=4),
+    )
+    runner.state_cache = {"aborted-step-request": aborted_state}
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"aborted-step-request", "already-retired-request"},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    runner._cleanup_finished_step_requests(scheduler_output)
+
+    assert released == [("aborted-step-request", True)]
+    assert runner.state_cache == {}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_cleanup_finished_step_requests_tolerates_pipeline_without_release_hook():
+    """Pipelines without native request-scoped resources need no hook."""
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.state_cache = {"aborted-step-request": object()}
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"aborted-step-request"},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    runner._cleanup_finished_step_requests(scheduler_output)
+
     assert runner.state_cache == {}
 
 
