@@ -90,6 +90,45 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 `-s` takes the base URL; the client appends `/v1` itself.
 
+##### Step execution and step-wise batching
+
+Add `--step-execution` to serve the denoise loop one step at a time, driven by
+the scheduler; `--max-num-seqs` sets how many requests may be mid-denoise at
+once, with new requests admitted between steps:
+
+```bash
+vllm serve sensenova/SenseNova-U1.5-8B-MoT --omni --port 8091 \
+    --step-execution --max-num-seqs 4
+```
+
+Both t2i (with and without think) and it2i run on the step path; text-only
+chat requests keep the complete-request path. Waves are conservative — each
+request keeps its own prefix KV caches and CFG branches, so every wave runs
+one transformer forward per request rather than a packed forward. Batching
+therefore interleaves concurrent requests' denoise steps and admits or cancels
+requests at wave boundaries (abort latency is at most one step) without
+changing per-step kernel efficiency. Step execution cannot be combined with a
+diffusion cache backend (TeaCache, Cache-DiT). See
+[Diffusion Execution Modes](../../docs/user_guide/diffusion/execution_modes.md#step-execution).
+
+#### Measured step execution (1x A800 80GB, 1024x1024, 25 steps, BF16)
+
+Pixel consistency: for t2i (think off), t2i (think on), and it2i, the step
+path and the complete-request path with the same seed produce bit-identical
+PNGs (matching SHA-256 digests).
+
+| Scenario | Result |
+| --- | --- |
+| Single request, step mode | 5.23 s (vs 5.31 s complete-request) |
+| 4 concurrent requests, `--max-num-seqs 4` | 20.69 s total, 0.193 img/s, all 4 images produced |
+| 4 concurrent requests, `--max-num-seqs 1` (queued) | 20.72 s total, 0.192 img/s |
+| Mid-flight admission (requests staggered 1.5 s) | all 4 requests complete; late arrivals join mid-denoise |
+| Abort mid-denoise (2 peers in flight) | 2 ms client-observed latency; victim aborts without an image; both peers complete |
+
+Batched total time matches queued serial time — each wave still runs one
+forward per request — so keep `--max-num-seqs 1` for pure throughput; raise it
+when you need mid-flight admission or wave-boundary cancellation.
+
 #### Measured latency (1x A800 80GB, 25 steps, median of 3 after a warmup)
 
 | Resolution | Step latency | Total |

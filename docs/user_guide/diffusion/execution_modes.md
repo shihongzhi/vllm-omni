@@ -122,7 +122,16 @@ honors the packed `cu_seqlens` metadata, so run it with
 fall back to one transformer forward per request). Batching H3 does not improve
 its throughput — see the measured numbers in the
 [MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md)
-— so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
+— so keep `--max-num-seqs 1` unless you need step-level scheduling. SenseNova-U1.5
+supports step-wise continuous batching for t2i (with and without think) and
+it2i; text-only chat requests keep the complete-request path. Its waves are
+conservative: every request keeps its own prefix KV caches and CFG branches,
+so each wave runs one transformer forward per request instead of a packed
+forward. Batching still interleaves the denoise steps of concurrent requests,
+admits new requests mid-denoise, and cancels aborted ones at the next wave,
+but per-step kernel efficiency does not improve — prefer `--max-num-seqs 1`
+unless you need step-level scheduling or concurrent admission. Step execution
+cannot be combined with a diffusion cache backend. Consult the
 selected pipeline's documentation and source for the latest support status.
 
 ## Streaming Output
