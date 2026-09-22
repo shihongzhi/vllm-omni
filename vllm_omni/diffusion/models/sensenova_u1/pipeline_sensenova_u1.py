@@ -1716,13 +1716,31 @@ class SenseNovaU1Pipeline(
     ) -> torch.Tensor | None:
         """Run one denoise forward per request and concatenate on the batch dim.
 
-        The step forward is request-local (flash KV caches and geometry live on
-        each state), so the runner-assembled ``input_batch`` only provides the
-        selected states. Its rows concatenate to the layout ``step_scheduler``
-        consumes: one slice of ``latents.shape[0]`` rows per request.
+        Step batching here is deliberately conservative: every request owns
+        its flash KV caches, geometry, and CFG branch structure (t2i and it2i
+        differ in both branches and prefix layout), so a wave executes one
+        transformer forward per request rather than packing them together.
+        That request-local ownership is also what makes heterogeneous waves
+        safe: mixed t2i/it2i, different step counts, and requests at different
+        step indices all forward independently (request size and CFG settings
+        are additionally kept homogeneous per wave by the scheduler's
+        step-batch compatibility key). A packed forward would need varlen
+        attention over per-request prefixes, as MiniMax-H3 does on backends
+        that isolate packed cu_seqlens, and is left as a follow-up; the
+        runner contract only depends on the row layout below.
+
+        The runner-assembled ``input_batch`` only provides the selected
+        states. Their rows concatenate to the layout ``step_scheduler``
+        consumes: one slice of ``latents.shape[0]`` rows per request, in
+        ``states`` order.
         """
         del kwargs
         selected = states if states is not None else input_batch.states
+        if len(selected) > 1:
+            logger.debug(
+                "SenseNova-U1.5 denoise step: %d request(s), one forward each",
+                len(selected),
+            )
         v_preds = []
         for req in selected:
             _, _, _, v_pred = self._run_single_denoise_step(
