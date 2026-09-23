@@ -57,6 +57,7 @@ from .paged_decode import (
     PagedDecodeCache,
     dynamic_lora_wrappers_present,
     paged_decode_supported,
+    sequential_offload_hook_present,
 )
 from .sensenova_u1_transformer import (
     SenseNovaU1CausalLMOutput,
@@ -757,6 +758,12 @@ class SenseNovaU1Pipeline(
         head_dim = self.language_model.model.layers[0].self_attn.head_dim
         if not paged_decode_supported(torch.device(self.device), head_dim):
             return None
+        # Model-level CPU offload swaps parameters and synchronizes the
+        # platform inside ``language_model.forward``; a capture may do neither,
+        # and a replay would skip the swap. The eager path the hooked forward
+        # already serves is the fallback.
+        if sequential_offload_hook_present(self.language_model):
+            return None
         if past_key_values is None or not past_key_values.layers:
             return None
         layer0 = past_key_values.layers[0]
@@ -1317,8 +1324,9 @@ class SenseNovaU1Pipeline(
         schedule every shorter step over the whole bucket (+0.144 ms/token
         measured on an A800), spending the saved capture within a few
         requests. Requests past it, dynamic-LoRA serving and the sleep-level-2
-        release all keep today's lazy capture. Best effort, like the warmup
-        around it.
+        release all keep today's lazy capture; model-level CPU offload disables
+        the paged path outright, capture and replay alike. Best effort, like
+        the warmup around it.
         """
         try:
             lm = self.language_model
@@ -1329,6 +1337,8 @@ class SenseNovaU1Pipeline(
             if not paged_decode_supported(device, head_dim):
                 return
             if dynamic_lora_wrappers_present(lm):
+                return
+            if sequential_offload_hook_present(lm):
                 return
             if prefill_cache is None or not prefill_cache.layers:
                 return

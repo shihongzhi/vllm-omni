@@ -732,6 +732,36 @@ def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypat
     assert getattr(host, "_paged_decode", None) is None, "an adapted capture was left on the pipeline"
 
 
+def test_sequential_offload_takes_the_eager_path(monkeypatch):
+    """Model-level CPU offload hooks ``language_model`` as its DiT component,
+    and the hook moves parameters and synchronizes the platform inside every
+    forward -- capture forbids both ("operation not permitted when stream is
+    capturing"), and a replay would skip the swap the hook exists to make. The
+    paged path has to step aside at readiness and at serving, and come back
+    once the hook is removed.
+    """
+    from vllm_omni.diffusion.hooks import HookRegistry
+    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    HookRegistry.get_or_create(host.language_model).register_hook(
+        SequentialOffloadHook._HOOK_NAME,
+        SequentialOffloadHook(offload_targets=[], device=torch.device("cpu")),
+    )
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "warm captured under a hook that synchronizes"
+    assert ctx(host, _dyn_cache(10)) is None, "serving reached the capture path under offload"
+
+    host.language_model._hook_registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
+    warm(host, _dyn_cache(2))
+    assert host._paged_decode is not None, "the path stayed down after the hook was removed"
+    assert host._paged_decode[0].bucket == READINESS_DECODE_WARM_BUCKET
+
+
 @cuda_only
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_second_request_replays_the_first_capture(monkeypatch):
@@ -1005,6 +1035,47 @@ def test_a_failed_prefill_warmup_still_tries_the_graphs(monkeypatch):
     monkeypatch.setattr(SenseNovaU1Pipeline, "_warm_paged_decode_graphs", lambda self, cache: seen.append(cache))
     SenseNovaU1Pipeline._warm_ar_decode(host)
     assert seen == [None], "a failed prefill warmup skipped the graph warmup"
+
+
+def test_a_working_prefill_warmup_builds_the_readiness_stash(monkeypatch):
+    """The hand-off from the eager warmup to the graph warm is the one path no
+    other test drives: the dummy-warmup test stubs ``_warm_ar_decode`` out, the
+    failure test above only covers the ``None`` case, and the graph tests call
+    ``_warm_paged_decode_graphs`` directly -- so deleting the ``prefill_cache``
+    hand-off outright stayed green while the readiness capture silently never
+    happened in production. Drive it with a language model whose prefill
+    returns a real cache, and pin that the stash grew out of exactly that
+    prefill.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    calls: list[bool] = []
+
+    class _HandoffLM(torch.nn.Module):
+        """Prefill returns a cache the graph warm can be handed off from."""
+
+        def forward(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
+            calls.append(past_key_values is None)
+            if past_key_values is None:
+                return SimpleNamespace(past_key_values=_dyn_cache(2))
+            return SimpleNamespace(past_key_values=past_key_values)
+
+    lm = _HandoffLM()
+    lm.model = SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(head_dim=HEAD_DIM))] * LAYERS)
+    host.language_model = lm
+
+    pipe_mod.SenseNovaU1Pipeline._warm_ar_decode(host)
+
+    stash = host._paged_decode
+    assert stash is not None, "a working prefill never built the readiness stash"
+    assert stash[0].bucket == READINESS_DECODE_WARM_BUCKET
+    assert calls == [True, False], "the eager warmup prefill or its decode step did not run"
+    # The stash grew out of the prefill the eager warmup produced, not a bare
+    # allocation: its first rows are that prefill's K, verbatim.
+    torch.testing.assert_close(
+        stash[0].k[0].view(-1, KV_HEADS, HEAD_DIM)[:2],
+        _dyn_cache(2).layers[0].keys[0].transpose(0, 1),
+    )
 
 
 @cuda_only
