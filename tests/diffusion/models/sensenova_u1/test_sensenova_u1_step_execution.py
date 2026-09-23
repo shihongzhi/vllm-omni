@@ -155,6 +155,8 @@ def test_step_execution_matches_full_request_path(think_text, is_it2i, monkeypat
     rec_step = _install_recorder(pipe_step)
     _track_cleanup(monkeypatch, rec_step)
     req = _build_step_request(sn_step, p_step, think_text, is_it2i)
+    # Cache references must be captured before post_decode clears the dicts.
+    cond_step, uncond_step = sn_step.caches["cond"], sn_step.caches["uncond"]
     input_batch = types.SimpleNamespace(states=(req,))
 
     while not req.denoise_completed:
@@ -194,7 +196,7 @@ def test_step_execution_matches_full_request_path(think_text, is_it2i, monkeypat
     assert req.denoise_completed
 
     # post_decode released exactly the non-dict cache entries, like the loop.
-    assert rec_step.cleaned == [sn_step.caches["cond"], sn_step.caches["uncond"]]
+    assert rec_step.cleaned == [cond_step, uncond_step]
 
 
 def test_step_scheduler_update_matches_reference_euler_step():
@@ -323,21 +325,27 @@ def test_post_decode_releases_caches_even_on_decode_failure(monkeypatch):
     released = []
     monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: released.append(cache))
     req = _build_step_request(sn, p, think_text="reasoning...")
+    cond, uncond = sn.caches["cond"], sn.caches["uncond"]
 
     out = pipe.post_decode(req)
     assert out.output["metadata"]["text"] == {"think_text": "reasoning..."}
-    assert released == [sn.caches["cond"], sn.caches["uncond"]]
+    assert released == [cond, uncond]
+    # The release empties the cache dict, so a repeat release is a no-op.
+    assert not sn.caches
+    pipe.release_step_state(req)
+    assert released == [cond, uncond]
 
     def exploding_decode(image_prediction, think_text=""):
         raise RuntimeError("decode exploded")
 
     pipe._build_diffusion_output = exploding_decode
-    req2 = _build_step_request(sn, p)
+    # A fresh request proves the finally-path releases even when decode raises.
+    _, sn2, _ = _make_setup()
+    cond2, uncond2 = sn2.caches["cond"], sn2.caches["uncond"]
+    req2 = _build_step_request(sn2, p)
     with pytest.raises(RuntimeError, match="decode exploded"):
         pipe.post_decode(req2)
-    # finally-path cleanup ran for the second release attempt too (idempotent
-    # stubs: the same cache objects are re-released).
-    assert released.count(sn.caches["cond"]) == 2
+    assert released == [cond, uncond, cond2, uncond2]
 
 
 def test_pre_process_func_routes_text_requests_to_full_forward():
