@@ -292,6 +292,10 @@ def test_prepare_encode_populates_step_request_state():
     assert req.extra[_STEP_PARAMS].num_steps == STEPS
     assert req.extra[_STEP_THINK_TEXT] == "thoughts"
     assert req.extra[_STEP_IS_IT2I] is False
+    # Retire the way a completed request does so the state's finalize release
+    # (registered by prepare_encode) has nothing left to clear after the test.
+    pipe.release_step_state(req)
+    assert not sn_state.caches
 
 
 def test_prepare_encode_routes_image_requests_to_it2i():
@@ -305,6 +309,8 @@ def test_prepare_encode_routes_image_requests_to_it2i():
     assert calls == {"t2i": 0, "it2i": 1}
     assert req.extra[_STEP_IS_IT2I] is True
     assert req.extra[_STEP_THINK_TEXT] == "edited"
+    pipe.release_step_state(req)
+    assert not sn_state.caches
 
 
 def test_prepare_encode_rejects_text_only_requests():

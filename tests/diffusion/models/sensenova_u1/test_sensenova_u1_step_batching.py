@@ -21,6 +21,7 @@ slice, with ``post_decode`` firing per request as soon as its own schedule is
 exhausted.
 """
 
+import gc
 import types
 
 import numpy as np
@@ -28,7 +29,6 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 as pipe_mod
-from vllm_omni.diffusion.models.interface import release_step_state_if_supported
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
     _STEP_DENOISE_STATE,
     _STEP_IS_IT2I,
@@ -342,36 +342,42 @@ def test_mid_flight_admission_continues_older_request(monkeypatch):
 def test_aborted_request_peer_unaffected(monkeypatch):
     """Aborting one request mid-denoise releases its caches and spares peers.
 
-    The abort takes effect at a wave boundary: the runner retires the state
-    when the next wave assembles and releases the cancelled request's caches
-    through the step-state release hook (the idempotent release post_decode
-    runs on the completion path, which this request never reaches). The wave
-    peer keeps evolving exactly as a solo run.
+    The abort takes effect at a wave boundary: the runner retires the request
+    by dropping its state, and the pipeline frees the request-local caches
+    from the finalize hook ``prepare_encode`` attached to that state (the same
+    idempotent release ``post_decode`` runs on the completion path, which this
+    request never reaches). The wave peer keeps evolving exactly as a solo
+    run.
     """
     solo_calls, solo_out, _ = _solo_run(monkeypatch, seed=1234, request_id="req-a")
 
     pipe, sn_a, p_a = _make_setup(seed=1234)
-    _, sn_b, p_b = _make_setup(seed=5678)
+    _, sn_b, _ = _make_setup(seed=5678)
     recorder = _install_recorder(pipe)
     _track_cleanup(monkeypatch, recorder)
     cond_a = sn_a.caches["cond"]
     cond_b = sn_b.caches["cond"]
     uncond_b = sn_b.caches["uncond"]
     req_a = _build_step_request(sn_a, p_a, request_id="req-a")
-    req_b = _build_step_request(sn_b, p_b, request_id="req-b")
+    # Admit req-b the way the runner does, through the real prepare_encode, so
+    # the finalize release is registered exactly as in serving.
+    pipe._extract_input_images = lambda prompt: None
+    pipe._prepare_t2i = lambda p: (sn_b, "")
+    req_b = StepRequestState(
+        request_id="req-b",
+        sampling=types.SimpleNamespace(height=H, width=W, num_inference_steps=STEPS, seed=9, extra_args={}),
+        prompt="a boat",
+    )
+    pipe.prepare_encode(req_b)
 
     _drive_wave(pipe, [req_a, req_b])
 
-    # Cancel req-b between waves: the runner pops its state and calls the
-    # pipeline release hook with aborted=True, the way
-    # _cleanup_finished_step_requests does.
-    release_step_state_if_supported(pipe, req_b, aborted=True)
+    # Cancel req-b between waves: the runner pops the state and drops every
+    # reference to it; the finalize release fires on collection.
+    del req_b
+    gc.collect()
     assert recorder.cleaned == [cond_b, uncond_b]
-    # The release is idempotent: the runner may call it again at retirement
-    # after another path (here, a deliberate repeat) already released.
     assert not sn_b.caches
-    release_step_state_if_supported(pipe, req_b, aborted=True)
-    assert recorder.cleaned == [cond_b, uncond_b]
 
     while not req_a.denoise_completed:
         _drive_wave(pipe, [req_a])

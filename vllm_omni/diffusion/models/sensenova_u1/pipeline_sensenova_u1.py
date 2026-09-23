@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -43,10 +44,7 @@ from vllm_omni.diffusion.lora.loader import (
     _remap_state_dict_keys,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import (
-    SupportsComponentDiscovery,
-    SupportsStepStateRelease,
-)
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -543,10 +541,26 @@ class SenseNovaDenoiseState:
     caches: dict = field(default_factory=dict)
 
 
+def _release_denoise_caches(caches: dict) -> None:
+    """Release a retired step request's flash KV caches (idempotent).
+
+    Module-level ``weakref.finalize`` target: the shared step runner retires
+    a request — abort, interrupt, or failure — by dropping its state without
+    any pipeline-visible callback, so the release is attached to the state's
+    lifetime in ``prepare_encode`` and runs as soon as the runner forgets the
+    request. Emptying ``caches`` makes a repeat release a no-op, which the
+    normal completion path relies on (``post_decode`` releases first, the
+    finalizer second).
+    """
+    for key in ("cond", "uncond", "img_cond"):
+        if key in caches and not isinstance(caches[key], dict):
+            clear_flash_kv_cache(caches[key])
+    caches.clear()
+
+
 class SenseNovaU1Pipeline(
     nn.Module,
     SupportsComponentDiscovery,
-    SupportsStepStateRelease,
     DiffusionPipelineProfilerMixin,
     CFGParallelMixin,
     LoraLoaderMixin,
@@ -1713,6 +1727,14 @@ class SenseNovaU1Pipeline(
         state.extra[_STEP_PARAMS] = p
         state.extra[_STEP_THINK_TEXT] = think_text
         state.extra[_STEP_IS_IT2I] = is_it2i
+        # The shared runner retires an aborted, interrupted, or failed step
+        # request by dropping its state — there is no pipeline-visible
+        # retirement callback — and the request-scoped flash KV caches must be
+        # released explicitly rather than left to tensor refcounting. Attach
+        # the release to the state's lifetime: it fires as soon as the runner
+        # forgets the request, and is a no-op after post_decode's release on
+        # normal completion.
+        weakref.finalize(state, _release_denoise_caches, sn_state.caches)
         return state
 
     def denoise_step(
@@ -1776,22 +1798,20 @@ class SenseNovaU1Pipeline(
         state.step_index += 1
 
     def release_step_state(self, state: StepRequestState, *, aborted: bool = False) -> None:
-        """Release the request-local denoising KV caches (SupportsStepStateRelease).
+        """Release the request-local denoising KV caches (idempotent).
 
-        The flash KV cache tensors are attached to the transformer layers as
-        attributes, so they survive garbage collection of the runner state;
-        this hook lets the runner free them at every retirement point (abort,
-        interrupt, per-request failure, and normal completion after
-        ``post_decode``). Emptying ``caches`` makes a repeat release a no-op,
-        which the runner relies on: normal completion releases once in
-        ``post_decode`` and again from the retirement hook.
+        This is the synchronous half of the step-state cleanup: ``post_decode``
+        routes its finally through here on normal completion, and tests call it
+        directly. The asynchronous half is the ``weakref.finalize`` hook that
+        ``prepare_encode`` attaches to the state, which runs the same release
+        when the runner drops an aborted or failed request. Both halves share
+        :func:`_release_denoise_caches`, whose ``caches.clear()`` makes any
+        repeat release a no-op.
         """
         del aborted
         sn_state = state.extra.get(_STEP_DENOISE_STATE)
-        if sn_state is None:
-            return
-        self._cleanup_denoise_caches(sn_state.caches)
-        sn_state.caches.clear()
+        if sn_state is not None:
+            _release_denoise_caches(sn_state.caches)
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Decode the final image prediction and release the denoising caches."""
