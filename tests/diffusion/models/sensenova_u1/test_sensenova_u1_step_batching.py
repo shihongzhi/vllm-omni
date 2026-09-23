@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Step-wise batching tests for the SenseNova-U1.5 pipeline.
 
 A step-mode wave carries several in-flight requests through one
@@ -317,9 +317,7 @@ def test_mid_flight_admission_continues_older_request(monkeypatch):
     pipe._prepare_t2i = lambda p: (sn_b, "")
     req_b = StepRequestState(
         request_id="req-b",
-        sampling=types.SimpleNamespace(
-            height=H, width=W, num_inference_steps=STEPS, seed=9, extra_args={}
-        ),
+        sampling=types.SimpleNamespace(height=H, width=W, num_inference_steps=STEPS, seed=9, extra_args={}),
         prompt="a boat",
     )
     returned = pipe.prepare_encode(req_b)

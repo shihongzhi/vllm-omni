@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Step-execution tests for the SenseNova-U1.5 pipeline.
 
 ``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` / ``post_decode``
@@ -264,16 +264,12 @@ def _make_prepare_setup():
     pipe, sn_state, _ = _make_setup()
     calls = {"t2i": 0, "it2i": 0}
     pipe._prepare_t2i = lambda p: (calls.__setitem__("t2i", calls["t2i"] + 1) or (sn_state, "thoughts"))
-    pipe._prepare_it2i = lambda p, imgs: (
-        calls.__setitem__("it2i", calls["it2i"] + 1) or (sn_state, "edited")
-    )
+    pipe._prepare_it2i = lambda p, imgs: (calls.__setitem__("it2i", calls["it2i"] + 1) or (sn_state, "edited"))
     return pipe, sn_state, calls
 
 
 def _prepare_sampling():
-    return types.SimpleNamespace(
-        height=None, width=None, num_inference_steps=STEPS, seed=7, extra_args={}
-    )
+    return types.SimpleNamespace(height=None, width=None, num_inference_steps=STEPS, seed=7, extra_args={})
 
 
 def test_prepare_encode_populates_step_request_state():
@@ -355,15 +351,11 @@ def test_pre_process_func_routes_text_requests_to_full_forward():
 
     fn = get_sensenova_u1_pre_process_func(types.SimpleNamespace(step_execution=True))
 
-    text_req = types.SimpleNamespace(
-        prompt={"prompt": "hi", "modalities": ["text"]}, use_step_execution=True
-    )
+    text_req = types.SimpleNamespace(prompt={"prompt": "hi", "modalities": ["text"]}, use_step_execution=True)
     assert fn(text_req) is text_req
     assert text_req.use_step_execution is False
 
-    img_req = types.SimpleNamespace(
-        prompt={"prompt": "hi", "modalities": ["image"]}, use_step_execution=True
-    )
+    img_req = types.SimpleNamespace(prompt={"prompt": "hi", "modalities": ["image"]}, use_step_execution=True)
     fn(img_req)
     assert img_req.use_step_execution is True
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Behavioral-equivalence tests for the split denoising-loop helpers.
 
 ``_run_denoising_loop()`` owns a request-local :class:`SenseNovaDenoiseState`
@@ -159,9 +159,7 @@ def _reference_denoising_loop(pipe, state, p, think_text="", is_it2i=False):
             -1,
         )
         if pipe.model_cfg.add_noise_scale_embedding:
-            ns_tensor = torch.full_like(
-                t_expanded, ns.noise_scale / pipe.model_cfg.noise_scale_max_value
-            )
+            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / pipe.model_cfg.noise_scale_max_value)
             ns_emb = pipe.fm_modules["noise_scale_embedder"](ns_tensor).view(
                 p.batch_size,
                 ns.token_h * ns.token_w,
@@ -172,9 +170,7 @@ def _reference_denoising_loop(pipe, state, p, think_text="", is_it2i=False):
 
         v_pred = pipe._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
         z = z + (t_next - t) * v_pred
-        image_prediction = _unpatchify(
-            z, pipe.patch_size * merge_size, p.image_size[1], p.image_size[0]
-        )
+        image_prediction = _unpatchify(z, pipe.patch_size * merge_size, p.image_size[1], p.image_size[0])
 
     for key in ("cond", "uncond", "img_cond"):
         if key in caches and not isinstance(caches[key], dict):
@@ -186,9 +182,7 @@ def _reference_denoising_loop(pipe, state, p, think_text="", is_it2i=False):
 def _run_reference(monkeypatch, think_text, is_it2i):
     pipe, state, p = _make_setup()
     recorder = _install_recorder(pipe)
-    monkeypatch.setattr(
-        pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache)
-    )
+    monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache))
     final_state, images = _reference_denoising_loop(pipe, state, p, think_text, is_it2i)
     return recorder, final_state, images, state.caches
 
@@ -196,9 +190,7 @@ def _run_reference(monkeypatch, think_text, is_it2i):
 def _run_current(monkeypatch, think_text, is_it2i):
     pipe, state, p = _make_setup()
     recorder = _install_recorder(pipe)
-    monkeypatch.setattr(
-        pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache)
-    )
+    monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache))
     output = pipe._run_denoising_loop(state, p, think_text, is_it2i)
     return recorder, output, state.caches
 
@@ -253,9 +245,7 @@ def test_single_step_helper_does_not_mutate_image_state():
 def test_cleanup_runs_on_exception_path(monkeypatch):
     pipe, state, p = _make_setup()
     recorder = _install_recorder(pipe)
-    monkeypatch.setattr(
-        pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache)
-    )
+    monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache))
 
     def failing_denoise(*args, **kwargs):
         if recorder.denoise_calls:
@@ -299,9 +289,7 @@ def test_init_noise_and_schedule_builds_request_state():
         noise_scale_mode=None,
         noise_scale_max_value=2.0,
     )
-    p = types.SimpleNamespace(
-        batch_size=BATCH, num_steps=STEPS, image_size=[W, H], seed=7, timestep_shift=3.0
-    )
+    p = types.SimpleNamespace(batch_size=BATCH, num_steps=STEPS, image_size=[W, H], seed=7, timestep_shift=3.0)
 
     state = pipe._init_noise_and_schedule(p)
 

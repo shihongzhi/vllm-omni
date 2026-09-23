@@ -1208,9 +1208,17 @@ class SenseNovaU1Pipeline(
             timesteps=timesteps,
         )
 
-    def _get_cfg_kwargs(self, caches: dict, image_embeds, t, z,
-                        state: SenseNovaDenoiseState, p, branch: str,
-                        cache_dit_skip: bool = False):
+    def _get_cfg_kwargs(
+        self,
+        caches: dict,
+        image_embeds,
+        t,
+        z,
+        state: SenseNovaDenoiseState,
+        p,
+        branch: str,
+        cache_dit_skip: bool = False,
+    ):
         required = (branch, f"idx_{branch}", f"mask_{branch}")
         missing = [key for key in required if key not in caches]
         if missing:
@@ -1613,9 +1621,7 @@ class SenseNovaU1Pipeline(
 
         return t, t_next, z, image_embeds
 
-    def _run_single_denoise_step(
-        self, image_prediction, state: SenseNovaDenoiseState, p, step_i, is_it2i
-    ):
+    def _run_single_denoise_step(self, image_prediction, state: SenseNovaDenoiseState, p, step_i, is_it2i):
         """Run one denoise forward. Must not mutate ``image_prediction``."""
         t, t_next, z, image_embeds = self._prepare_denoise_step_inputs(image_prediction, state, p, step_i)
 
@@ -1659,9 +1665,7 @@ class SenseNovaU1Pipeline(
         """
         try:
             for step_i in range(p.num_steps):
-                t, t_next, z, v_pred = self._run_single_denoise_step(
-                    state.image_prediction, state, p, step_i, is_it2i
-                )
+                t, t_next, z, v_pred = self._run_single_denoise_step(state.image_prediction, state, p, step_i, is_it2i)
                 state.image_prediction = self._apply_denoise_step_update(z, t, t_next, v_pred, p)
         finally:
             self._cleanup_denoise_caches(state.caches)
