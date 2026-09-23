@@ -115,7 +115,7 @@ diffusion cache backend (TeaCache, Cache-DiT). See
 
 Pixel consistency: for t2i (think off), t2i (think on), and it2i, the step
 path and the complete-request path with the same seed produce bit-identical
-PNGs (matching SHA-256 digests).
+PNG output (matching SHA-256 digests).
 
 | Scenario | Result |
 | --- | --- |
