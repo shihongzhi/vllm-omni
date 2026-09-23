@@ -51,6 +51,7 @@ from vllm_omni.transformers_utils.configs.sensenova_u1 import (
 )
 
 from .paged_decode import (
+    BUCKETS,
     READINESS_DECODE_WARM_BUCKET,
     DecodeGraphRunner,
     PagedDecodeCache,
@@ -747,9 +748,9 @@ class SenseNovaU1Pipeline(
         request and re-captured every time. Reuse rests on the same thing the
         paged path already rests on -- one sequence in flight per pipeline
         forward. The stash may also be the one ``_warm_paged_decode_graphs``
-        built at readiness, already grown to ``READINESS_DECODE_WARM_BUCKET`` and
-        captured there, in which case serving below that bucket replays without
-        capturing at all.
+        built at readiness, already grown to ``READINESS_DECODE_WARM_BUCKET``
+        and captured once per bucket below it, in which case serving below
+        that bucket replays without capturing at all.
         """
         if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
             return None
@@ -1301,17 +1302,21 @@ class SenseNovaU1Pipeline(
         self._warm_paged_decode_graphs(prefill_cache)
 
     def _warm_paged_decode_graphs(self, prefill_cache) -> None:
-        """Pre-capture the decode graph at readiness, up to ``READINESS_DECODE_WARM_BUCKET``.
+        """Pre-capture one decode graph per bucket at readiness, to ``READINESS_DECODE_WARM_BUCKET``.
 
         Left lazy, the first think request pays for its own captures -- one per
-        bucket boundary its sequence crosses, about 0.7 s across the 512 and
-        1024 ones, which medians hide and its P100 carries. A cache pre-grown to
+        bucket boundary its sequence crosses, 0.16-0.17 s of capture out of the
+        ~0.7 s it owes in total, the rest being compile -- which medians hide
+        and its P100 carries. A cache pre-grown to
         ``READINESS_DECODE_WARM_BUCKET`` ends that: attention reads the live
-        ``seqused`` at replay, so the one graph captured against the synthetic
-        warmup prefix serves every sequence in the bucket, and serving finds
-        the stash
-        through ``_decode_context`` without ever growing the cache below that
-        bucket. Requests past it, dynamic-LoRA serving and the sleep-level-2
+        ``seqused`` at replay, so the graphs captured against the synthetic
+        warmup prefix serve every sequence inside their buckets, and serving
+        finds the stash through ``_decode_context`` without ever growing the
+        cache below that bucket. One graph per bucket, not one for the top,
+        because ``max_seqlen_k`` is baked at capture: a lone 2048 graph would
+        schedule every shorter step over the whole bucket (+0.144 ms/token
+        measured on an A800), spending the saved capture within a few
+        requests. Requests past it, dynamic-LoRA serving and the sleep-level-2
         release all keep today's lazy capture. Best effort, like the warmup
         around it.
         """
@@ -1340,13 +1345,19 @@ class SenseNovaU1Pipeline(
             if cache is None:
                 return
             runner = DecodeGraphRunner(lm, cache, device)
-            cache.set_length(cache.length + 1)
-            runner.step(0, cache.length - 1)
+            # A step below the top bucket has to replay its own bucket's
+            # graph, so each bucket gets its own capture. Each capture needs a
+            # length inside its bucket; the zeros the buffer was allocated
+            # with stand in for the unwritten prefix.
+            warmed = [bucket for bucket in BUCKETS if bucket <= cache.bucket]
+            for bucket in warmed:
+                cache.set_length(bucket)
+                runner.step(0, bucket - 1)
             self._paged_decode = (cache, runner)
             logger.info(
-                "Captured decode graph at readiness for bucket %d (%d capture)",
-                cache.bucket,
+                "Captured %d decode graphs at readiness, buckets %s",
                 runner.captures,
+                warmed,
             )
         except Exception as exc:  # pragma: no cover - warmup is best effort
             logger.warning("Decode graph warmup skipped: %s", exc)
