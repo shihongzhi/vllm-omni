@@ -17,6 +17,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("/data/models/ernie-image-turbo", True),
         ("/data/models/ernie-image-turbo/", True),
         ("/data/models/ernie-image-base", False),
+        (
+            "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image-Turbo"
+            "/snapshots/deadbeefdeadbeef",
+            True,
+        ),
+        (
+            "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image"
+            "/snapshots/deadbeefdeadbeef",
+            False,
+        ),
+        (
+            "hub/models--baidu--ERNIE-Image-Turbo/snapshots/deadbeef/vae",
+            True,
+        ),
     ],
 )
 def test_detect_distilled_by_name(model, expected, monkeypatch):

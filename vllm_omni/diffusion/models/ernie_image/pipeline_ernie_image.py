@@ -30,6 +30,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.transformers_utils.repo_utils import repo_name_from_path
 
 logger = init_logger(__name__)
 
@@ -284,7 +285,9 @@ class ErnieImagePipeline(
             return bool(marker)
         # Current upstream ERNIE-Image repos ship no is_distilled marker in
         # model_index.json, so fall back to the checkpoint name until they do.
-        return "turbo" in os.path.basename(model.rstrip("/")).lower()
+        # Cached snapshot paths end in a commit hash, so resolve them back to
+        # the repo name first.
+        return "turbo" in repo_name_from_path(model).lower()
 
     def encode_prompt(
         self,
