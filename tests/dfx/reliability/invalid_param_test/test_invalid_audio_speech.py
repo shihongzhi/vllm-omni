@@ -157,8 +157,8 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
                 "ref_audio": None,
                 "ref_text": None,
             },
-            ("Invalid voice", "vivian"),
-            id="customvoice_invalid_voice",
+            ("Base checkpoint does not support task_type='CustomVoice'",),
+            id="base_checkpoint_customvoice_task_mismatch",
         ),
         pytest.param(
             {"task_type": "InvalidEnum"}, ("task_type", "literal_error", "CustomVoice"), id="task_type_invalid"
