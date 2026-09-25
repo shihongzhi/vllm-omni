@@ -160,9 +160,12 @@ pytest -q tests/diffusion/models/sensenova_u1/
   without capturing and without growing the cache, across the old 512/1024 boundaries. A
   request past it -- a long prompt, or an image edit with think, where image tokens push
   prefix plus think loop over 2048 -- still captures lazily on its first run, as does the
-  first request after
-  a sleep-level-2 wake, which drops the captures along with the memory they recorded. Dynamic
-  LoRA serving never reuses a capture: a wrapper in the module tree disables the stash for
+  first request after a sleep-level-2 wake, which drops the captures along with the memory
+  they recorded. When a request grows the cache beyond the readiness allocation, the
+  allocation generation changes. Subsequent shorter requests may lazily recapture their
+  512/1024 graphs for the new allocation. Graphs captured for the previous generation
+  remain in `_graphs` until a sleep-level-2 release. Dynamic LoRA serving never reuses a
+  capture: a wrapper in the module tree disables the stash for
   every request. Model-level CPU offload (`--enable-cpu-offload`) turns the paged path off
   entirely: the offload hook moves parameters and synchronizes inside the forward, which a
   capture forbids, so decode stays on the ordinary cache that hooked forward serves.
