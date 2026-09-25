@@ -24,8 +24,7 @@ from vllm_omni.metrics.duplex_frame_timing import (
     log_connector_get_event,
     log_frame_timing,
     log_stage1_decode_event,
-    pop_chunk_put_age_ms,
-    record_chunk_put,
+    stamp_chunk_put,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -58,7 +57,6 @@ def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:
 @pytest.fixture
 def timing_enabled(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", "1")
-    monkeypatch.setattr(duplex_frame_timing, "_put_stamps_ns", OrderedDict())
     monkeypatch.setattr(duplex_frame_timing, "_log_sequence", itertools.count(start=1))
 
 
@@ -208,31 +206,23 @@ def test_get_tick_pacer_evicts_oldest_streams(
     assert ("append", "s3") in duplex_frame_timing._tick_pacers
 
 
-def test_chunk_handoff_age_uses_put_stamp(timing_enabled: None) -> None:
-    record_chunk_put("r1_0_0", t_ns=1_000_000_000)
-
-    age_ms = pop_chunk_put_age_ms("r1_0_0", now_ns=1_000_000_000 + 1_500_000)
-
-    assert age_ms == pytest.approx(1.5)
-    # The stamp is consumed: a second pop cannot double-report.
-    assert pop_chunk_put_age_ms("r1_0_0") is None
-
-
-def test_chunk_handoff_age_is_none_without_a_same_process_put(
-    timing_enabled: None,
-) -> None:
-    assert pop_chunk_put_age_ms("never-put") is None
-
-
-def test_record_chunk_put_requires_the_flag(
+def test_stamp_chunk_put_stamps_meta_only_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from vllm_omni.data_entry_keys import MetaStruct
+
+    meta = MetaStruct()
     monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
-    monkeypatch.setattr(duplex_frame_timing, "_put_stamps_ns", OrderedDict())
+    stamp_chunk_put(meta)
+    # Unstamped meta keeps omit_defaults true, so the field stays off the
+    # wire for consumers running any code version.
+    assert meta.put_t_ns is None
 
-    record_chunk_put("r1_0_0")
-
-    assert pop_chunk_put_age_ms("r1_0_0") is None
+    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", "1")
+    before_ns = time.monotonic_ns()
+    stamp_chunk_put(meta)
+    assert meta.put_t_ns is not None
+    assert before_ns <= meta.put_t_ns <= time.monotonic_ns()
 
 
 def test_append_event_reports_tick_period_with_default_fallback(
@@ -304,24 +294,33 @@ def test_audio_emit_event_skips_non_cadence_results(
     assert _lines(caplog) == []
 
 
-def test_connector_get_event_reports_chunk_age(
-    monkeypatch: pytest.MonkeyPatch,
+def test_connector_get_event_reports_chunk_age_from_put_stamp(
     timing_enabled: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setattr(duplex_frame_timing, "_put_stamps_ns", OrderedDict())
-    record_chunk_put("r1_0_0", t_ns=time.monotonic_ns() - 1_500_000)
-
     with _capture_module_logs(caplog):
-        log_connector_get_event("r1_0_0", 1, 128, frame_timing_clock())
+        log_connector_get_event("r1_0_0", 1, 128, frame_timing_clock(), put_t_ns=time.monotonic_ns() - 1_500_000)
 
     (line,) = _lines(caplog)
     assert line.startswith("DUPLEX_FRAME_TIMING event=connector_get t_ns=")
     assert "bytes=128" in line
     assert "wrap_ms=" in line
-    # Cross-process gets have no same-process put to join on.
-    assert "chunk_age_ms=" in line
-    assert "chunk_age_ms=na" not in line
+    age_ms = float(line.split("chunk_age_ms=")[1].split()[0])
+    # The stamp is a host-clock monotonic stamp, so the age crosses process
+    # boundaries; here it is the 1.5 ms since the synthetic put.
+    assert age_ms == pytest.approx(1.5, abs=0.5)
+
+
+def test_connector_get_event_reports_na_without_a_put_stamp(
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _capture_module_logs(caplog):
+        log_connector_get_event("r1_0_0", 1, 128, frame_timing_clock())
+
+    (line,) = _lines(caplog)
+    # Producer ran with the flag off: no stamp rode the chunk.
+    assert "chunk_age_ms=na" in line
 
 
 def test_frame_timing_synchronize_only_syncs_when_enabled(
@@ -383,8 +382,14 @@ def test_connector_put_site_emits_and_stamps(
     from vllm_omni.data_entry_keys import OmniPayloadStruct
     from vllm_omni.distributed.omni_connectors.transfer_adapter import chunk_transfer_adapter
 
+    put_payloads: list[OmniPayloadStruct] = []
+
+    def _fake_put(**kwargs: object) -> tuple[bool, int, dict]:
+        put_payloads.append(kwargs["data"])
+        return True, 128, {}
+
     adapter = SimpleNamespace(
-        connector=SimpleNamespace(stage_id=1, put=lambda **_kwargs: (True, 128, {})),
+        connector=SimpleNamespace(stage_id=1, put=_fake_put),
         custom_process_next_stage_input_func=lambda **_kwargs: OmniPayloadStruct(),
         _accepts_new_token_ids=lambda _processor: False,
         put_req_chunk=defaultdict(int),
@@ -409,8 +414,10 @@ def test_connector_put_site_emits_and_stamps(
     assert "ok=true" in line
     assert "bytes=128" in line
     assert "wrap_ms=" in line
-    # The put side stamped the chunk for the same-process handoff age.
-    assert pop_chunk_put_age_ms("r1_1_0") is not None
+    # The outgoing chunk itself carries the put stamp the receiving process
+    # will report as its chunk_age_ms.
+    (payload,) = put_payloads
+    assert payload.meta.put_t_ns is not None
 
 
 def test_stage1_decode_site_reports_frame_count(

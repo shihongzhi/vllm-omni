@@ -22,11 +22,13 @@ engine-resident session owner with the #7413 rework).
   input ``drift_ms`` against the tick budget.
 - ``connector_put`` (chunk transfer adapter, stage worker): chunk written
   into the inter-stage connector; ``wrap_ms`` is the ``connector.put`` wall
-  time.
+  time, and the site stamps ``meta.put_t_ns`` on the outgoing chunk.
 - ``connector_get`` (chunk transfer adapter, next stage worker): chunk read
   out of the connector; ``wrap_ms`` is the ``connector.get`` wall time and
-  ``chunk_age_ms`` the put→get age when both sides run in one process. Across
-  processes, join ``key`` + ``t_ns`` from the two lines offline.
+  ``chunk_age_ms`` the put→get age from the chunk's ``meta.put_t_ns`` stamp.
+  Both stamps are host-scoped ``time.monotonic_ns()``, so the age is valid
+  across the producer and consumer processes; it reads ``na`` when the
+  producing side ran with the flag off.
 - ``stage1_decode`` (PersonaPlex Code2Wav, stage-1 worker): streaming Mimi
   decode time for the new frames of a request. The site closes the span with
   ``frame_timing_synchronize()`` so ``decode_ms`` covers GPU execution, at
@@ -63,7 +65,6 @@ from __future__ import annotations
 
 import itertools
 import os
-import threading
 import time
 from collections import OrderedDict
 from typing import Any
@@ -78,14 +79,12 @@ _TRUTHY_FLAGS = ("1", "true", "yes", "on")
 # serving adapter ships 80 ms ticks (one duplex frame of audio).
 DEFAULT_TICK_PERIOD_MS = 80.0
 
-# Streams (session-scoped pacers) and connector handoff stamps come and go
-# without a close hook at these sites, so both registries are LRU-capped
-# instead of relying on explicit lifecycle plumbing from the callers.
+# Streams (session-scoped pacers) come and go without a close hook at these
+# sites, so the registry is LRU-capped instead of relying on explicit
+# lifecycle plumbing from the callers.
 _MAX_TRACKED_STREAMS = 1024
-_MAX_TRACKED_HANDOFFS = 4096
 
 _log_sequence = itertools.count(start=1)
-_handoff_lock = threading.Lock()
 
 
 def duplex_frame_timing_enabled() -> bool:
@@ -209,31 +208,16 @@ def get_tick_pacer(scope: str, stream_id: str, period_s: float) -> DuplexTickPac
     return pacer
 
 
-_put_stamps_ns: OrderedDict[str, int] = OrderedDict()
-
-
-def record_chunk_put(key: str, t_ns: int | None = None) -> None:
-    """Stamp a connector chunk at put time so the receiving side can report
-    its handoff age when both run in the same process."""
+def stamp_chunk_put(meta: Any) -> None:
+    """Stamp ``meta.put_t_ns`` on a chunk about to enter the inter-stage
+    connector, so the receiving process — possibly a different one — can
+    report the handoff age: every stamp is host-scoped
+    ``time.monotonic_ns()``, and ``MetaStruct``'s ``omit_defaults`` keeps it
+    off the wire (mixed-version safe) while unset. A no-op while the flag is
+    unset."""
     if not duplex_frame_timing_enabled():
         return
-    stamp = time.monotonic_ns() if t_ns is None else t_ns
-    with _handoff_lock:
-        _put_stamps_ns[key] = stamp
-        while len(_put_stamps_ns) > _MAX_TRACKED_HANDOFFS:
-            _put_stamps_ns.popitem(last=False)
-
-
-def pop_chunk_put_age_ms(key: str, now_ns: int | None = None) -> float | None:
-    """Consume the put stamp for ``key`` and return its age in ms, or None
-    when the matching put happened in another process (join offline via the
-    ``connector_put`` / ``connector_get`` log lines instead)."""
-    with _handoff_lock:
-        stamp = _put_stamps_ns.pop(key, None)
-    if stamp is None:
-        return None
-    now = time.monotonic_ns() if now_ns is None else now_ns
-    return (now - stamp) / 1e6
+    meta.put_t_ns = time.monotonic_ns()
 
 
 def _tick_period_ms(tick_period_ms: float | None) -> float:
@@ -305,10 +289,10 @@ def log_connector_put_event(
 ) -> None:
     """Site hook (chunk transfer adapter): chunk written into the connector.
     ``started_at`` is the ``frame_timing_clock()`` stamp taken before the
-    put."""
+    put; the site stamps ``meta.put_t_ns`` separately via
+    ``stamp_chunk_put()``."""
     if not duplex_frame_timing_enabled():
         return
-    record_chunk_put(key)
     log_frame_timing(
         "connector_put",
         key=key,
@@ -324,10 +308,15 @@ def log_connector_get_event(
     stage_id: int,
     size: int,
     started_at: float,
+    put_t_ns: int | None = None,
 ) -> None:
     """Site hook (chunk transfer adapter): chunk read out of the connector.
     ``started_at`` is the ``frame_timing_clock()`` stamp taken before the
-    get."""
+    get. ``put_t_ns`` is the chunk's ``meta.put_t_ns`` stamp, so
+    ``chunk_age_ms`` is the put→get handoff age — valid across the producer
+    and consumer processes because both stamps are host-scoped
+    ``time.monotonic_ns()``; ``None`` (logged ``na``) when the producing
+    side ran with the flag off."""
     if not duplex_frame_timing_enabled():
         return
     log_frame_timing(
@@ -336,7 +325,7 @@ def log_connector_get_event(
         stage=stage_id,
         bytes=int(size),
         wrap_ms=(time.perf_counter() - started_at) * 1e3,
-        chunk_age_ms=pop_chunk_put_age_ms(key),
+        chunk_age_ms=None if put_t_ns is None else (time.monotonic_ns() - put_t_ns) / 1e6,
     )
 
 

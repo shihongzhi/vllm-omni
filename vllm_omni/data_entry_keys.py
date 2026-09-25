@@ -221,6 +221,14 @@ class MetaStruct(_StructBase):
     audio_seed: int | None = None
     token_role_ids: torch.Tensor | None = None
     minimax_h3_prepared_reference_videos: str | None = None
+    # Frame-timing stamp (``time.monotonic_ns()``, host-scoped so it stays
+    # comparable across the producer and consumer processes) taken when this
+    # chunk is put into the inter-stage connector, set only while
+    # ``VLLM_OMNI_DUPLEX_FRAME_TIMING`` is on. The receiving side reports it
+    # as the connector_get ``chunk_age_ms``; ``omit_defaults`` keeps the
+    # stamp off the wire otherwise, so the field is optional in both
+    # directions.
+    put_t_ns: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

@@ -20,6 +20,7 @@ from vllm_omni.metrics.duplex_frame_timing import (
     frame_timing_clock,
     log_connector_get_event,
     log_connector_put_event,
+    stamp_chunk_put,
 )
 
 from ..adapter import construct_next_stage_streaming_input_prompt
@@ -529,11 +530,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     return True
             return False
 
+        # The producer's meta.put_t_ns stamp rides the chunk itself, so the
+        # handoff age is measurable even when the two stages are different
+        # processes; absent when the producer ran with the flag off.
+        received = result[0] if isinstance(result, tuple) and result else None
+        received_meta = received.get("meta") if isinstance(received, dict) else None
+        put_t_ns = received_meta.get("put_t_ns") if isinstance(received_meta, dict) else None
         log_connector_get_event(
             connector_get_key,
             stage_id,
             int(result[1]) if isinstance(result, tuple) else 0,
             get_t0,
+            put_t_ns if isinstance(put_t_ns, int) and not isinstance(put_t_ns, bool) else None,
         )
 
         with self._receiver_state_lock:
@@ -828,6 +836,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         put_t0 = frame_timing_clock()
+        stamp_chunk_put(payload_data.meta)
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
