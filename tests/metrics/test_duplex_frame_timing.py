@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
-import itertools
 import logging
 import threading
 import time
@@ -56,16 +55,19 @@ def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 @pytest.fixture
 def timing_enabled(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", "1")
-    monkeypatch.setattr(duplex_frame_timing, "_log_sequence", itertools.count(start=1))
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", True)
+    monkeypatch.setattr(duplex_frame_timing, "_event_counts", {})
+
+
+@pytest.fixture
+def timing_disabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", False)
 
 
 def test_disabled_by_default_emits_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+    timing_disabled: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
-
     assert not duplex_frame_timing_enabled()
     with _capture_module_logs(caplog):
         log_frame_timing("append", session="s1", jitter_ms=1.0)
@@ -74,15 +76,18 @@ def test_disabled_by_default_emits_nothing(
 
 
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE"])
-def test_flag_accepts_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", value)
-    assert duplex_frame_timing_enabled()
+def test_flag_accepts_truthy_values(value: str) -> None:
+    assert duplex_frame_timing._parse_flag(value)
 
 
-@pytest.mark.parametrize("value", ["", "0", "false", "off", "no"])
-def test_flag_rejects_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", value)
-    assert not duplex_frame_timing_enabled()
+@pytest.mark.parametrize("value", ["", "0", "false", "off", "no", None])
+def test_flag_rejects_falsy_values(value: str | None) -> None:
+    assert not duplex_frame_timing._parse_flag(value)
+
+
+@pytest.mark.parametrize("raw,expected", [("1", 1), ("5", 5), ("0", 1), ("-3", 1), ("", 1), (None, 1), ("n/a", 1)])
+def test_log_every_parsing_clamps_to_every_event(raw: str | None, expected: int) -> None:
+    assert duplex_frame_timing._parse_log_every(raw) == expected
 
 
 def test_log_line_is_greppable_and_joinable(
@@ -115,7 +120,7 @@ def test_log_every_throttles_per_event_lines(
     timing_enabled: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY", "3")
+    monkeypatch.setattr(duplex_frame_timing, "_LOG_EVERY", 3)
 
     with _capture_module_logs(caplog):
         for _ in range(7):
@@ -123,6 +128,26 @@ def test_log_every_throttles_per_event_lines(
 
     emitted = _lines(caplog)
     assert len(emitted) == 3  # events 1, 4 and 7 survive the 1-in-3 throttle
+
+
+def test_log_every_counts_per_event_name(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(duplex_frame_timing, "_LOG_EVERY", 2)
+
+    # Alternating sites must not starve each other: a single global
+    # sequence would let one event type monopolize the surviving phase.
+    with _capture_module_logs(caplog):
+        for _ in range(4):
+            log_frame_timing("connector_put", key="r1_1_0")
+            log_frame_timing("connector_get", key="r1_1_0")
+
+    emitted = _lines(caplog)
+    assert len(emitted) == 4
+    assert sum("event=connector_put" in line for line in emitted) == 2
+    assert sum("event=connector_get" in line for line in emitted) == 2
 
 
 def test_tick_pacer_first_observation_has_no_jitter() -> None:
@@ -212,13 +237,13 @@ def test_stamp_chunk_put_stamps_meta_only_when_enabled(
     from vllm_omni.data_entry_keys import MetaStruct
 
     meta = MetaStruct()
-    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", False)
     stamp_chunk_put(meta)
     # Unstamped meta keeps omit_defaults true, so the field stays off the
     # wire for consumers running any code version.
     assert meta.put_t_ns is None
 
-    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", "1")
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", True)
     before_ns = time.monotonic_ns()
     stamp_chunk_put(meta)
     assert meta.put_t_ns is not None
@@ -255,7 +280,7 @@ def test_append_event_skips_empty_reservations_and_the_disabled_flag(
 
     assert _lines(caplog) == []
 
-    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", False)
     with _capture_module_logs(caplog):
         log_append_event("s1", 2, 7680, 80)
 
@@ -335,11 +360,11 @@ def test_frame_timing_synchronize_only_syncs_when_enabled(
         SimpleNamespace(synchronize=lambda: sync_calls.append("sync")),
     )
 
-    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", False)
     frame_timing_synchronize()
     assert sync_calls == []
 
-    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", "1")
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", True)
     frame_timing_synchronize()
     assert sync_calls == ["sync"]
 
@@ -348,7 +373,7 @@ def test_site_hooks_are_free_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", False)
 
     assert frame_timing_clock() == 0.0
     with _capture_module_logs(caplog):

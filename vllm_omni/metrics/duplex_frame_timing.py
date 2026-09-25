@@ -4,7 +4,10 @@
 
 Enabled with ``VLLM_OMNI_DUPLEX_FRAME_TIMING=1`` (off by default); per-event
 lines can be throttled with ``VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY``
-(default ``1`` = every event). Every line shares the ``DUPLEX_FRAME_TIMING``
+(default ``1`` = every event, counted per event name so interleaved sites
+keep their sampling rate). Both variables are read once at process start —
+the worker processes inherit the serving environment — so every hook stays
+free of ``os.environ`` reads. Every line shares the ``DUPLEX_FRAME_TIMING``
 prefix and a ``t_ns`` stamp (``time.monotonic_ns()``), the same clock family
 the client-side duplex timeline uses, so events from the API server and the
 stage worker processes can be joined on one host and, eventually, aligned
@@ -63,7 +66,6 @@ flow, payload contents, or ordering.
 
 from __future__ import annotations
 
-import itertools
 import os
 import time
 from collections import OrderedDict
@@ -75,6 +77,31 @@ logger = init_logger(__name__)
 
 _TRUTHY_FLAGS = ("1", "true", "yes", "on")
 
+
+def _parse_flag(raw: str | None) -> bool:
+    return (raw or "").lower() in _TRUTHY_FLAGS
+
+
+def _parse_log_every(raw: str | None) -> int:
+    try:
+        return max(1, int(raw or 1))
+    except ValueError:
+        return 1
+
+
+# Read once at import — the same module-cached env-gate pattern as
+# DEFAULT_INPUT_WAIT_TIMEOUT_S — so the per-frame hooks never touch
+# os.environ on the duplex hot path.
+_DUPLEX_FRAME_TIMING_ENABLED = _parse_flag(os.environ.get("VLLM_OMNI_DUPLEX_FRAME_TIMING"))
+_LOG_EVERY = _parse_log_every(os.environ.get("VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY"))
+
+# Per-event-name cadence counters for the LOG_EVERY throttle: a single
+# global sequence interleaves every site, so with alternating
+# connector_put / connector_get calls one event type can monopolize the
+# surviving phase and the other drops out entirely at LOG_EVERY > 1. Dict
+# access races at worst skew one sampled line; not worth a lock.
+_event_counts: dict[str, int] = {}
+
 # Tick budget when capabilities do not advertise one. Every native duplex
 # serving adapter ships 80 ms ticks (one duplex frame of audio).
 DEFAULT_TICK_PERIOD_MS = 80.0
@@ -84,19 +111,25 @@ DEFAULT_TICK_PERIOD_MS = 80.0
 # lifecycle plumbing from the callers.
 _MAX_TRACKED_STREAMS = 1024
 
-_log_sequence = itertools.count(start=1)
-
-
 def duplex_frame_timing_enabled() -> bool:
     """Whether per-frame duplex timing instrumentation is switched on."""
-    return os.environ.get("VLLM_OMNI_DUPLEX_FRAME_TIMING", "").lower() in _TRUTHY_FLAGS
+    return _DUPLEX_FRAME_TIMING_ENABLED
 
 
-def _log_every() -> int:
-    try:
-        return max(1, int(os.environ.get("VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY", "1") or 1))
-    except ValueError:
-        return 1
+def log_frame_timing(event: str, /, **fields: Any) -> None:
+    """Emit one greppable structured line for a frame-timing event.
+
+    A no-op unless ``VLLM_OMNI_DUPLEX_FRAME_TIMING`` is set; subject to the
+    ``..._LOG_EVERY`` throttle otherwise, counted per event name so each
+    site keeps a uniform sampling rate even when event types interleave."""
+    if not duplex_frame_timing_enabled():
+        return
+    count = _event_counts.get(event, 0)
+    _event_counts[event] = count + 1
+    if count % _LOG_EVERY != 0:
+        return
+    body = " ".join(f"{key}={_format_field(value)}" for key, value in fields.items())
+    logger.info("DUPLEX_FRAME_TIMING event=%s t_ns=%d %s", event, time.monotonic_ns(), body)
 
 
 def _format_field(value: Any) -> str:
@@ -107,20 +140,6 @@ def _format_field(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.3f}"
     return str(value)
-
-
-def log_frame_timing(event: str, /, **fields: Any) -> None:
-    """Emit one greppable structured line for a frame-timing event.
-
-    A no-op unless ``VLLM_OMNI_DUPLEX_FRAME_TIMING`` is set; subject to the
-    ``..._LOG_EVERY`` throttle otherwise.
-    """
-    if not duplex_frame_timing_enabled():
-        return
-    if (next(_log_sequence) - 1) % _log_every() != 0:
-        return
-    body = " ".join(f"{key}={_format_field(value)}" for key, value in fields.items())
-    logger.info("DUPLEX_FRAME_TIMING event=%s t_ns=%d %s", event, time.monotonic_ns(), body)
 
 
 def frame_timing_clock() -> float:

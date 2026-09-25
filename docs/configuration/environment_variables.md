@@ -100,8 +100,8 @@ while the feature flag is unset.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `VLLM_OMNI_DUPLEX_FRAME_TIMING` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default off | Per-frame timing hooks on the duplex async-chunk path (session runner, chunk transfer adapter, PersonaPlex Code2Wav, session model channel); checked at each hook call | Environment-only setting. Values are case-normalized; any unrecognized value leaves instrumentation off. | Diagnostic |
-| `VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY` | Positive integer; default `1` (every event) | Throttle for per-event `DUPLEX_FRAME_TIMING` lines; evaluated each time a line is emitted | Environment-only setting. A non-integer or `<1` value falls back to `1` (no throttling). | Diagnostic |
+| `VLLM_OMNI_DUPLEX_FRAME_TIMING` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default off | Per-frame timing hooks on the duplex async-chunk path (session runner, chunk transfer adapter, PersonaPlex Code2Wav, session model channel); read once at process start | Environment-only setting. Values are case-normalized; any unrecognized value leaves instrumentation off. | Diagnostic |
+| `VLLM_OMNI_DUPLEX_FRAME_TIMING_LOG_EVERY` | Positive integer; default `1` (every event) | Throttle for per-event `DUPLEX_FRAME_TIMING` lines, counted per event name; read once at process start | Environment-only setting. A non-integer or `<1` value falls back to `1` (no throttling). | Diagnostic |
 
 ### NIXL stage transfer
 
