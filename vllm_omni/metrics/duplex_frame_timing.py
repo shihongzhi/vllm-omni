@@ -28,7 +28,12 @@ engine-resident session owner with the #7413 rework).
   ``chunk_age_ms`` the put→get age when both sides run in one process. Across
   processes, join ``key`` + ``t_ns`` from the two lines offline.
 - ``stage1_decode`` (PersonaPlex Code2Wav, stage-1 worker): streaming Mimi
-  decode time for the new frames of a request.
+  decode time for the new frames of a request. The site closes the span with
+  ``frame_timing_synchronize()`` so ``decode_ms`` covers GPU execution, at
+  the documented cost of serializing stage-1 decode across the requests of a
+  forward while the flag is on; ``num_req`` reports that forward's batch
+  size (RFC #7389 item 8) so decode cost is only compared to the tick budget
+  at a known batch level.
 - ``audio_emit`` (model channel, engine): an audio delta was projected for
   the client. Reports emit ``jitter_ms`` and output ``drift_ms`` against
   the tick budget — the server-side counterpart of the client receive
@@ -123,6 +128,23 @@ def frame_timing_clock() -> float:
     """Start stamp for a wrap-time interval; ``0.0`` (never logged) when the
     flag is unset, so disabled paths stay free of ``perf_counter`` calls."""
     return time.perf_counter() if duplex_frame_timing_enabled() else 0.0
+
+
+def frame_timing_synchronize() -> None:
+    """Close a ``frame_timing_clock()`` span whose measured work is a device
+    launch (stage-1 Mimi decode) with a host sync, so the logged wrap time
+    includes GPU execution instead of just the launch.
+
+    Calling this per request serializes stage-1 decode — the documented cost
+    of real ``decode_ms`` numbers. A no-op while the flag is unset, and goes
+    through ``current_omni_platform`` rather than a direct accelerator sync
+    so it stays correct on every backend.
+    """
+    if not duplex_frame_timing_enabled():
+        return
+    from vllm_omni.platforms import current_omni_platform
+
+    current_omni_platform.synchronize()
 
 
 class DuplexTickPacer:
@@ -292,7 +314,7 @@ def log_connector_put_event(
         key=key,
         stage=stage_id,
         ok=bool(ok),
-        bytes=int(size or 0),
+        bytes=int(size) if isinstance(size, (int, float)) else 0,
         wrap_ms=(time.perf_counter() - started_at) * 1e3,
     )
 
@@ -322,15 +344,19 @@ def log_stage1_decode_event(
     request_id: str | None,
     frames: int,
     started_at: float,
+    num_req: int,
 ) -> None:
     """Site hook (PersonaPlex Code2Wav): streaming Mimi decode of the new
     frames of a request. ``started_at`` is the ``frame_timing_clock()`` stamp
-    taken before the decode."""
+    taken before the decode and closed by ``frame_timing_synchronize()``, so
+    ``decode_ms`` covers GPU execution. ``num_req`` is the forward's batch
+    size the decode ran under (RFC #7389 item 8)."""
     if not duplex_frame_timing_enabled():
         return
     log_frame_timing(
         "stage1_decode",
         request_id=request_id if request_id is not None else "unknown",
         frames=int(frames),
+        num_req=int(num_req),
         decode_ms=(time.perf_counter() - started_at) * 1e3,
     )

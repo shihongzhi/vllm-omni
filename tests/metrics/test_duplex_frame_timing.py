@@ -17,6 +17,7 @@ from vllm_omni.metrics.duplex_frame_timing import (
     DuplexTickPacer,
     duplex_frame_timing_enabled,
     frame_timing_clock,
+    frame_timing_synchronize,
     get_tick_pacer,
     log_append_event,
     log_audio_emit_event,
@@ -323,6 +324,27 @@ def test_connector_get_event_reports_chunk_age(
     assert "chunk_age_ms=na" not in line
 
 
+def test_frame_timing_synchronize_only_syncs_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm_omni.platforms as platforms_module
+
+    sync_calls: list[str] = []
+    monkeypatch.setattr(
+        platforms_module,
+        "current_omni_platform",
+        SimpleNamespace(synchronize=lambda: sync_calls.append("sync")),
+    )
+
+    monkeypatch.delenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", raising=False)
+    frame_timing_synchronize()
+    assert sync_calls == []
+
+    monkeypatch.setenv("VLLM_OMNI_DUPLEX_FRAME_TIMING", "1")
+    frame_timing_synchronize()
+    assert sync_calls == ["sync"]
+
+
 def test_site_hooks_are_free_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -331,7 +353,7 @@ def test_site_hooks_are_free_when_disabled(
 
     assert frame_timing_clock() == 0.0
     with _capture_module_logs(caplog):
-        log_stage1_decode_event("req-1", 5, frame_timing_clock())
+        log_stage1_decode_event("req-1", 5, frame_timing_clock(), 1)
 
     assert _lines(caplog) == []
     # No perf_counter stamp is taken while disabled, so wrap timings stay
@@ -344,12 +366,13 @@ def test_stage1_decode_event_maps_missing_request_id(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with _capture_module_logs(caplog):
-        log_stage1_decode_event(None, 5, frame_timing_clock())
+        log_stage1_decode_event(None, 5, frame_timing_clock(), 3)
 
     (line,) = _lines(caplog)
     assert line.startswith("DUPLEX_FRAME_TIMING event=stage1_decode t_ns=")
     assert "request_id=unknown" in line
     assert "frames=5" in line
+    assert "num_req=3" in line
     assert "decode_ms=" in line
 
 
@@ -391,13 +414,24 @@ def test_connector_put_site_emits_and_stamps(
 
 
 def test_stage1_decode_site_reports_frame_count(
+    monkeypatch: pytest.MonkeyPatch,
     timing_enabled: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import torch
     from torch import nn
 
+    import vllm_omni.platforms as platforms_module
     from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import PersonaPlexCode2Wav
+
+    # The site closes its span with a platform host sync; stub it so the
+    # test stays on CPU and records that the sync ran.
+    sync_calls: list[str] = []
+    monkeypatch.setattr(
+        platforms_module,
+        "current_omni_platform",
+        SimpleNamespace(synchronize=lambda: sync_calls.append("sync")),
+    )
 
     class _FakeStreamingMimi(nn.Module):
         def streaming_init(self, batch_size: int) -> None:
@@ -432,4 +466,6 @@ def test_stage1_decode_site_reports_frame_count(
     assert line.startswith("DUPLEX_FRAME_TIMING event=stage1_decode t_ns=")
     assert "request_id=req-1" in line
     assert "frames=3" in line
+    assert "num_req=1" in line
     assert "decode_ms=" in line
+    assert sync_calls == ["sync"]
