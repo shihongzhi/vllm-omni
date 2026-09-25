@@ -399,6 +399,123 @@ def test_a_whole_decode_loop_matches_the_unpaged_path():
     assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
 
 
+@cuda_only
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_serving_the_512_tier_on_the_pregrown_stash_matches_the_unpaged_path(monkeypatch):
+    """The readiness configuration, which the loop above never runs.
+
+    ``test_a_whole_decode_loop_matches_the_unpaged_path`` grows the allocation
+    as it goes, so the buffer's bucket always tracks the length being served
+    and the 512 tier is only ever exercised on a 512 allocation. Serving after
+    the readiness warm runs it on a stash pre-grown to 2048, and two
+    regressions would be invisible in the other direction: scheduling from the
+    buffer's bucket is numerically correct (``seqused_k`` bounds the read) but
+    pays the top bucket's KV loop on every replay, and reading past ``seqused``
+    is only visible against the unpaged path. So: pre-grow, capture the way
+    readiness does, then replay a short sequence through the real runner and
+    require parity with the ``torch.cat``-grown reference at every step.
+    """
+    import torch.nn.functional as F
+
+    from vllm_omni.diffusion.models.sensenova_u1.paged_decode import DecodeGraphRunner
+
+    heads, kv_heads, dim = 8, 2, 64
+    prefill, steps = 60, 80  # ends at 140: the whole loop stays in the 512 tier
+    dev, dt = torch.device("cuda"), torch.bfloat16
+    scale = dim**-0.5
+    torch.manual_seed(11)
+
+    dyn = _Cache(
+        [
+            _Layer(
+                torch.randn(1, kv_heads, prefill, dim, device=dev, dtype=dt),
+                torch.randn(1, kv_heads, prefill, dim, device=dev, dtype=dt),
+            )
+        ]
+    )
+    paged = PagedDecodeCache.from_dynamic_cache(
+        dyn, 1, dev, dt, min_length=READINESS_DECODE_WARM_BUCKET
+    )
+    assert paged.bucket == READINESS_DECODE_WARM_BUCKET, "the fixture does not start pre-grown"
+    ref_k, ref_v = dyn.layers[0].keys.clone(), dyn.layers[0].values.clone()
+    proj = torch.randn(dim * heads, 128, device=dev, dtype=torch.float32)
+
+    # Every kernel call is recorded, capture and warmup alike -- replay bypasses
+    # Python entirely -- so the schedule each graph was baked with is pinned
+    # where the buffer's own bucket would have masked it. Only the Python int
+    # is recorded: reading the ``seqused`` tensor here would synchronize the
+    # device, which a capture forbids; the length at each call is known from
+    # the loop below.
+    scheduled: list[int] = []
+    real_flash = paged_decode._flash_varlen()
+
+    def recording(*args, **kwargs):
+        scheduled.append(kwargs["max_seqlen_k"])
+        return real_flash(*args, **kwargs)
+
+    monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: recording)
+
+    class _AttendLM(torch.nn.Module):
+        """One attention layer served out of the paged cache, so a captured
+        step's logits are its output. The step's q/k/v live here in buffers the
+        test rewrites between replays, the way the runner's input tensors do."""
+
+        def __init__(self):
+            super().__init__()
+            self.q = torch.zeros(1, heads, 1, dim, device=dev, dtype=dt)
+            self.k = torch.zeros(1, kv_heads, 1, dim, device=dev, dtype=dt)
+            self.v = torch.zeros_like(self.k)
+
+        def forward(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
+            return SimpleNamespace(logits=paged_cache.attend(0, self.q, self.k, self.v, scale))
+
+    lm = _AttendLM()
+    runner = DecodeGraphRunner(lm, paged, dev)
+    # The readiness warm's loop: a capture per bucket the allocation covers,
+    # each taken at a length inside its bucket, and each baking the kernel for
+    # that bucket alone -- not for the 2048 the buffer itself tops out at.
+    for bucket in [b for b in BUCKETS if b <= paged.bucket]:
+        paged.set_length(bucket)
+        calls = len(scheduled)
+        runner.step(0, bucket - 1)
+        assert scheduled[calls:] and set(scheduled[calls:]) == {bucket}, (
+            f"the {bucket} graph was captured with max_seqlen_k {sorted(set(scheduled[calls:]))}"
+        )
+    assert runner.captures == 3, "the warm loop did not capture one graph per bucket"
+    warm_calls = len(scheduled)
+
+    # Serving: the real prefix goes back in, and a sequence that stays under
+    # 512 replays on the 2048 allocation through the runner's own keying.
+    assert paged.load_prefix(dyn) and paged.length == prefill
+    paged_ids, ref_ids, worst = [], [], 0.0
+    for _ in range(steps):
+        lm.q.copy_(torch.randn(1, heads, 1, dim, device=dev, dtype=dt))
+        lm.k.copy_(torch.randn(1, kv_heads, 1, dim, device=dev, dtype=dt))
+        lm.v.copy_(torch.randn(1, kv_heads, 1, dim, device=dev, dtype=dt))
+        paged.set_length(paged.length + 1)
+        got = runner.step(0, paged.length - 1)
+
+        ref_k = torch.cat([ref_k, lm.k], dim=2)
+        ref_v = torch.cat([ref_v, lm.v], dim=2)
+        want = F.scaled_dot_product_attention(
+            lm.q, ref_k, ref_v, enable_gqa=True, scale=scale
+        ).transpose(1, 2)
+
+        worst = max(worst, (got.float() - want.float()).abs().max().item())
+        paged_ids.append(int((got.float().reshape(1, -1) @ proj).argmax()))
+        ref_ids.append(int((want.float().reshape(1, -1) @ proj).argmax()))
+
+    assert paged.bucket == READINESS_DECODE_WARM_BUCKET, "a 512-tier sequence grew the stash"
+    assert paged.generation == 0, "a 512-tier sequence reallocated the stash"
+    assert runner.captures == 3, "serving inside the warm bucket captured"
+    assert len(scheduled) == warm_calls, "a serving step ran the kernel outside a replay"
+    assert paged_ids == ref_ids, (
+        f"argmax diverges at step {next(i for i, (a, b) in enumerate(zip(paged_ids, ref_ids)) if a != b)}"
+    )
+    assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
+
+
 class _StubLM(torch.nn.Module):
     """Just enough CUDA work inside the capture for a pool to be allocated."""
 
