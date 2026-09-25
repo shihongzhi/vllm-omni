@@ -434,9 +434,7 @@ def test_serving_the_512_tier_on_the_pregrown_stash_matches_the_unpaged_path(mon
             )
         ]
     )
-    paged = PagedDecodeCache.from_dynamic_cache(
-        dyn, 1, dev, dt, min_length=READINESS_DECODE_WARM_BUCKET
-    )
+    paged = PagedDecodeCache.from_dynamic_cache(dyn, 1, dev, dt, min_length=READINESS_DECODE_WARM_BUCKET)
     assert paged.bucket == READINESS_DECODE_WARM_BUCKET, "the fixture does not start pre-grown"
     ref_k, ref_v = dyn.layers[0].keys.clone(), dyn.layers[0].values.clone()
     proj = torch.randn(dim * heads, 128, device=dev, dtype=torch.float32)
@@ -498,9 +496,7 @@ def test_serving_the_512_tier_on_the_pregrown_stash_matches_the_unpaged_path(mon
 
         ref_k = torch.cat([ref_k, lm.k], dim=2)
         ref_v = torch.cat([ref_v, lm.v], dim=2)
-        want = F.scaled_dot_product_attention(
-            lm.q, ref_k, ref_v, enable_gqa=True, scale=scale
-        ).transpose(1, 2)
+        want = F.scaled_dot_product_attention(lm.q, ref_k, ref_v, enable_gqa=True, scale=scale).transpose(1, 2)
 
         worst = max(worst, (got.float() - want.float()).abs().max().item())
         paged_ids.append(int((got.float().reshape(1, -1) @ proj).argmax()))
