@@ -22,6 +22,8 @@ tracked task, and aborting a stage request in the background.
 from __future__ import annotations
 
 import asyncio
+import copy
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
@@ -42,8 +44,8 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
     coerce_int,
-    payload_turn_id,
 )
+from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageOutput
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
@@ -114,6 +116,13 @@ class ModelChannel:
     ) -> dict[str, object]:
         session = self._ctx.session
         response_config = session.response_config
+        if not session.capabilities.supports_core_resumable_request and self.should_commit_response_to_history(
+            session, response_id
+        ):
+            # Committed-turn models can receive the next utterance before the
+            # speaker drains. Reserve the response's chronological slot now;
+            # an ACK fills it later without moving it past newer user input.
+            session.reserve_history_item(f"item_{response_id}")
         payload: dict[str, object] = {
             "type": "response.created",
             "session_id": session.session_id,
@@ -147,12 +156,16 @@ class ModelChannel:
         operation_id: str | None = None,
         final: bool,
         expected_epoch: int | None = None,
+        on_append_accepted: Callable[[float], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
         if not session.capabilities.supports_input_append:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        # Anchor the submission time before the RPC; the acceptance callback
+        # commits timing state only if the append actually submitted.
+        submit_time = time.monotonic()
         try:
             result = await self._append_via_data_plane(
                 payload,
@@ -170,6 +183,10 @@ class ModelChannel:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        # Commit timing state before returned output events can clear the
+        # silence-continuation chain (e.g. a terminal turn-end).
+        if on_append_accepted is not None:
+            on_append_accepted(submit_time)
         request_id, _ = duplex_data_plane_request_info(result)
         if request_id is not None:
             self._ctx.plugin.data_plane.begin_request(request_id)
@@ -194,22 +211,13 @@ class ModelChannel:
         session = self._ctx.session
         if self._ctx.stage_port.stage_count == 0:
             raise RuntimeError("duplex_data_plane_has_no_stage")
-        payload_turn = payload_turn_id(payload)
-        fence = DuplexFence(
-            session.session_id,
-            epoch=session.epoch,
-            turn_id=(
-                payload_turn
-                if payload_turn is not None
-                else (
-                    session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
-                )
-            ),
-        )
+        fence = helpers.append_fence(session, payload)
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
         stage_id = 0
-        request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id)
+        request_id = self._ctx.manager.stage_request_id(
+            fence, stage_id=stage_id, resumable=session.capabilities.supports_core_resumable_request
+        )
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True
@@ -218,10 +226,17 @@ class ModelChannel:
             request_context = self._ctx.manager.ensure_stage_request(session, stage_id=stage_id, fence=fence)
             if request_context is None:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
-            append_plan = self._ctx.plugin.plan_append(
+            prompt_payload: dict[str, object] = (
+                {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
+            )
+            append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
-                session_config=dict(request_context.session_config),
+                session_config=self._ctx.plugin.prepare_prompt_config(
+                    {**request_context.session_config, "conversation": list(session.history)},
+                    state=self._ctx.model_state,
+                    payload=prompt_payload,
+                ),
                 runtime_config=dict(request_context.runtime_config),
                 seq=reservation.update.seq,
                 turn_seq=reservation.update.turn_seq,
@@ -229,6 +244,10 @@ class ModelChannel:
                 final=final,
                 sampling_params=request_context.stage_sampling_params,
             )
+            # Preparation may yield while cancellation or session teardown runs.
+            # Never submit the worker's stale result to the model.
+            if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
+                raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
             submission = DuplexStageSubmission(
@@ -271,7 +290,7 @@ class ModelChannel:
                             "seq": update.seq,
                             "turn_id": update.turn_id,
                             "turn_seq": update.turn_seq,
-                            "resumable": True,
+                            "resumable": session.capabilities.supports_core_resumable_request,
                         },
                     }
                 ],
@@ -405,7 +424,7 @@ class ModelChannel:
             engine_output.finished = True
             engine_output = attach_duplex_output_decision(engine_output, item.decision)
         elif isinstance(output, OmniRequestOutput):
-            engine_output = output
+            engine_output = copy.copy(output)
             if finished:
                 engine_output.finished = True
         else:
@@ -417,6 +436,9 @@ class ModelChannel:
                 stage_id=item.stage_id,
                 final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
             )
+        engine_output.stage_id = item.stage_id
+        if self._ctx.plugin.projects_intermediate_outputs and item.stage_id < item.context.final_stage_id:
+            engine_output.finished = False
         snapshot = self.stage_metrics_snapshot(item.stage_id, item.metrics, output)
         if snapshot is not None:
             existing = engine_output.metrics if isinstance(engine_output.metrics, dict) else {}
@@ -453,6 +475,11 @@ class ModelChannel:
             await self._close_from_runtime(close_reason)
             return
         finished = self._data_plane_outputs_finished(drain_result)
+        if finished and not session.capabilities.supports_core_resumable_request:
+            if self._ctx.run.stream_request_id == item.request_id:
+                self._ctx.run.stream_request_id = None
+            await self._ctx.stage_port.cleanup([item.request_id])
+            return
         if finished and emitted_response and not self._out.auto_responds():
             # A finished, emitted response releases the per-request projector
             # cursor on its way out and offers the model another
@@ -809,6 +836,8 @@ class ModelChannel:
             mark_duration_ms,
             text_chars=mark_text_chars if mark_duration_ms is not None else None,
             audio_text_marks=audio_text_marks,
+            text_requires_complete_audio=model_result.get("text_requires_complete_audio") is True,
+            audio_complete=model_result.get("audio_complete") is True,
         )
         payload = {
             "type": "response.output_audio.delta",
