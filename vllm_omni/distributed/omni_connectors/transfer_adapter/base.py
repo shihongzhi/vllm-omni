@@ -28,16 +28,11 @@ class OmniTransferAdapterBase:
         self._pending_load_reqs: deque[Any] = deque()
         # Requests that have successfully retrieved data
         self._finished_load_reqs: set[str] = set()
-        self._cancelled_load_reqs: set[str] = set()
 
         # Requests that are waiting to be saved
         self._pending_save_reqs: deque[Any] = deque()
         # Requests that have successfully saved data
         self._finished_save_reqs: set[str] = set()
-
-        # external request-id translation, owned by chunk-shaped subclasses
-        # but maintained from the shared recv loop
-        self.request_ids_mapping: dict[str, str] = {}
 
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
@@ -72,10 +67,6 @@ class OmniTransferAdapterBase:
                     break
                 request = self._pending_load_reqs.popleft()
                 request_id = request.request_id
-                if request_id in self._cancelled_load_reqs:
-                    self._cancelled_load_reqs.discard(request_id)
-                    continue
-                self.request_ids_mapping[request_id] = request.external_req_id
                 try:
                     is_success = self._poll_single_request(request)
                     if is_success:
@@ -143,6 +134,8 @@ class OmniTransferAdapterBase:
                     logger.error("Send gave up for %s: %s", failed, e)
                     self.record_send_failure(failed, f"{type(e).__name__}: {e}")
 
+            if self.connector is not None:
+                self.connector.reap_consumed()
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():
                     self._save_cond.wait(timeout=0.1)

@@ -73,6 +73,10 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
+| `source_video` | file | null | MiniMax H3 latent-edit source video (`.mp4` or `.mov`, up to 512 MiB) |
+| `source_audio` | file | null | Optional MiniMax H3 latent-edit source audio (`.wav` or `.mp3`, up to 512 MiB) |
+| `video_noise_mask` | file | null | UTF-8 JSON MiniMax H3 video mask; `0` preserves and `1` regenerates a token |
+| `audio_noise_mask` | file | null | UTF-8 JSON MiniMax H3 audio mask; `0` preserves and `1` regenerates a token |
 | `width` | integer | model default | Output video width |
 | `height` | integer | model default | Output video height |
 | `num_frames` | integer | 1 | Number of generated frames |
@@ -116,7 +120,18 @@ request for execution.
 `DELETE /v1/videos/{video_id}` issues a bounded engine abort
 (`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
 task. Cancellation cleanup is also bounded and best-effort: it confirms
-the abort was queued, and the current request batch may still drain.
+the abort was submitted. In request execution mode, MiniMax-H3 checks
+cancellation at model boundaries,
+including before and after input preparation, after each denoising step, and
+before decode, and skips the remaining generation when cancelled. Input
+preparation or decoding already in progress may finish before the next boundary.
+Successful steps do not force device synchronization for cancellation.
+Parallel ranks agree before stopping; independent requests sharing a distributed
+AllGather offload wave can stop that wave early only when all its requests are
+cancelled, so a cancelled request cannot strand its live peers in a collective.
+In step execution mode, cancellation is handled by the scheduler between steps;
+the request-mode component-boundary checks do not apply within an active step.
+Other pipelines may still drain their current request batch.
 The job is then re-read so a completed save is not orphaned.
 
 ### Synchronous Response
@@ -213,6 +228,49 @@ can differ from the original host, and vLLM-Omni does not yet fully implement
 upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
+
+### MiniMax H3 Latent-Mask Editing
+
+MiniMax H3 accepts request-scoped source media and video/audio noise masks.
+At least one mask is required. A nontrivial `video_noise_mask` requires
+`source_video`, while a nontrivial `audio_noise_mask` requires either
+`source_audio` or a `source_video` with an audio stream. Mask values are in
+`[0, 1]`: `0` preserves the source, `1` regenerates it, and fractional values
+blend the two behaviors. Exact all-one masks are no-ops and do not require a
+source. Source uploads without a mask are rejected. Masks may be a JSON scalar
+or arrays matching the H3 latent/token grid; pixel-resolution masks must be
+resized or pooled by the client before upload.
+
+For an aligned output of `F` frames at `W x H`, the video latent grid is
+`[Tv, H/16, W/16]`, where `Tv = 2 + 5 * ((F - 5) / 17)`. The video mask may be
+a scalar, a flat token vector, `[Tv, H/32, W/32]`, or the full latent grid. For
+the model input, timestep, and velocity, a full-grid mask is max-pooled over
+each 2x2 spatial token and fractional values are rounded upward to 1/256
+levels. The final x0 restore uses the original, unquantized mask, so full-grid
+masks retain cell-level preservation inside a model token. The audio length is
+`Ta = round(F * 40 / 24)`, and its mask may be a scalar, `[Ta]`, `[2, Ta]`, or
+a flat `2 * Ta` vector. If source audio is short, its missing latent tail is
+forced to mask value `1` so H3 generates that portion. Each mask must be sent
+as a UTF-8 JSON file part and is limited to 8 MiB. A file may contain either a
+JSON scalar or an array.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=Partially restyle the complete clip and soundtrack" \
+  -F 'extra_params={"task":"t2va","duration":4.0,"aspect_ratio":"16:9"}' \
+  -F "source_video=@source.mp4;type=video/mp4" \
+  -F "source_audio=@source.wav;type=audio/wav" \
+  -F "video_noise_mask=@video-mask.json;type=application/json" \
+  -F "audio_noise_mask=@audio-mask.json;type=application/json" \
+  -o edited.mp4
+```
+
+For example, each mask file in the request above may contain the JSON scalar
+`0.5`.
+
+The server streams source files to temporary request-scoped storage and removes
+them after synchronous or asynchronous generation finishes. Models that do not
+declare latent-mask editing support reject these fields.
 
 ### Speech-to-Video
 
