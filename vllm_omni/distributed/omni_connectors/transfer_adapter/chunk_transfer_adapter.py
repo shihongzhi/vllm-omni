@@ -23,6 +23,7 @@ from vllm_omni.metrics.duplex_frame_timing import (
 )
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.base import OmniConnectorBase
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.initialization import resolve_connector_spec
@@ -173,7 +174,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        # Narrow the base's Optional connector: this adapter always builds
+        # one before super().__init__ runs.
+        self.connector: OmniConnectorBase = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -195,15 +198,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -287,7 +290,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.prefill_stats = PrefillStats()
 
     @classmethod
-    def create_connector(cls, model_config: Any):
+    def create_connector(cls, model_config: Any) -> OmniConnectorBase:
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
             connector_config = {}
@@ -370,8 +373,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def save_async(
         self,
-        multimodal_output: dict[str, Any] | None = None,
-        request: Request | None = None,
+        multimodal_output: dict[str, Any] | None,
+        request: Request,
         is_segment_finished: bool = False,
         new_token_ids: Iterable[int] | None = None,
         confirmed_num_computed_tokens: int | None = None,
@@ -1558,6 +1561,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
+            # No explicit ids: the caller must have passed the request map
+            # this branch iterates.
+            assert requests is not None
             request_ids = requests.keys()
 
         connector_owned_ids = {
