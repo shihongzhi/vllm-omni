@@ -42,7 +42,9 @@ engine-resident session owner with the #7413 rework).
 - ``audio_emit`` (model channel, engine): an audio delta was projected for
   the client. Reports emit ``jitter_ms`` and output ``drift_ms`` against
   the tick budget — the server-side counterpart of the client receive
-  timeline.
+  timeline — plus ``sent_ms``, the response's playback watermark before
+  this emit; the underrun margin follows offline as ``sent_ms`` minus the
+  wall time since the stream's first emitted ``t_ns``.
 
 Name and clock alignment with #7242 / #7025:
 
@@ -110,6 +112,7 @@ DEFAULT_TICK_PERIOD_MS = 80.0
 # sites, so the registry is LRU-capped instead of relying on explicit
 # lifecycle plumbing from the callers.
 _MAX_TRACKED_STREAMS = 1024
+
 
 def duplex_frame_timing_enabled() -> bool:
     """Whether per-frame duplex timing instrumentation is switched on."""
@@ -272,11 +275,14 @@ def log_audio_emit_event(
     request_id: str | None,
     audio_result: Any,
     tick_period_ms: float | None,
+    sent_ms: int | None = None,
 ) -> None:
     """Site hook (runtime bridge): an audio delta was projected for the
     client. ``audio_result`` is the projected native event; non-dict results
     and events without a positive ``audio_duration_ms`` are not cadence
-    points."""
+    points. ``sent_ms`` is the response's ``playback.sent_ms`` watermark
+    before this emit, so the feed-starvation (underrun) margin is derivable
+    offline against the stream's first emitted ``t_ns``."""
     if not duplex_frame_timing_enabled() or not isinstance(audio_result, dict):
         return
     duration_ms = audio_result.get("audio_duration_ms")
@@ -294,6 +300,7 @@ def log_audio_emit_event(
         # Coerced so the field renders like every other duration regardless
         # of the int/float the projected event carried.
         audio_duration_ms=float(duration_ms),
+        sent_ms=sent_ms,
         jitter_ms=None if jitter_s is None else jitter_s * 1e3,
         drift_ms=drift_s * 1e3,
     )

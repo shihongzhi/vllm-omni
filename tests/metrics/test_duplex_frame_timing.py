@@ -295,13 +295,30 @@ def test_audio_emit_event_derives_frames_from_duration(
     monkeypatch.setattr(duplex_frame_timing, "_tick_pacers", OrderedDict())
 
     with _capture_module_logs(caplog):
-        log_audio_emit_event("s1", 1, "req-1", {"audio_duration_ms": 240}, 80)
+        log_audio_emit_event("s1", 1, "req-1", {"audio_duration_ms": 240}, 80, sent_ms=160)
 
     (line,) = _lines(caplog)
     assert line.startswith("DUPLEX_FRAME_TIMING event=audio_emit t_ns=")
     assert "request_id=req-1" in line
     assert "frames=3" in line
     assert "audio_duration_ms=240.000" in line
+    # Pre-emit playback watermark: with the stream's first emitted t_ns the
+    # underrun margin is sent_ms - elapsed, joinable offline.
+    assert "sent_ms=160" in line
+
+
+def test_audio_emit_event_reports_na_watermark_without_a_playback_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(duplex_frame_timing, "_tick_pacers", OrderedDict())
+
+    with _capture_module_logs(caplog):
+        log_audio_emit_event("s1", 1, "req-1", {"audio_duration_ms": 240}, 80)
+
+    (line,) = _lines(caplog)
+    assert "sent_ms=na" in line
 
 
 @pytest.mark.parametrize(

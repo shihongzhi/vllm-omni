@@ -489,6 +489,10 @@ class ModelChannel:
                 request_id,
                 model_result,
                 session.capabilities.chunk_period_ms,
+                # Read before _send_one_model_output_event advances the
+                # watermark, so the line carries the pre-emit underrun
+                # exposure of this stream.
+                session.playback.sent_ms,
             )
             close_reason_for_result, did_emit = await self._send_one_model_output_event(
                 model_result,
@@ -758,8 +762,9 @@ class ModelChannel:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
             self._out.emit(self.response_created_payload(response_id, epoch=session.epoch))
+        stage_metrics = model_result.get("stage_metrics")
         response_stage_metrics = session.accumulate_response_stage_metrics(
-            model_result.get("stage_metrics") if isinstance(model_result.get("stage_metrics"), Mapping) else None
+            stage_metrics if isinstance(stage_metrics, Mapping) else None
         )
         if response_created:
             speak_payload = {
@@ -903,10 +908,10 @@ class ModelChannel:
         *,
         audio_offset_ms: int,
         text_offset_chars: int,
-    ) -> list[dict[str, int]] | None:
+    ) -> list[dict[str, object]] | None:
         if not audio_text_marks:
             return None
-        normalized: list[dict[str, int]] = []
+        normalized: list[dict[str, object]] = []
         for raw_mark in audio_text_marks:
             if not isinstance(raw_mark, dict):
                 continue
