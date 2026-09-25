@@ -18,13 +18,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("/data/models/ernie-image-turbo/", True),
         ("/data/models/ernie-image-base", False),
         (
-            "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image-Turbo"
-            "/snapshots/deadbeefdeadbeef",
+            "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image-Turbo/snapshots/deadbeefdeadbeef",
             True,
         ),
         (
-            "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image"
-            "/snapshots/deadbeefdeadbeef",
+            "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image/snapshots/deadbeefdeadbeef",
             False,
         ),
         (
