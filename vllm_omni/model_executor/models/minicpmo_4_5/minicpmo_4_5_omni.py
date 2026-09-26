@@ -144,6 +144,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # embeddings and initializes request-local codec generation state.
         self.has_preprocess = self.model_stage in {"llm", "tts"}
 
+        if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
+            # Build the Stage-0 duplex runtime (remote-code processor and
+            # tokenizer) with the model. Built lazily, it costs several seconds
+            # inside the first session's first audio unit, and the session then
+            # runs that far behind the real-time input stream. The loader
+            # constructs the model under the target-device context; the
+            # processor is CPU preprocessing, so keep its tensors on the CPU.
+            with torch.device("cpu"):
+                self._duplex_data_plane_helper()
+
     @cached_property
     def sampler(self):
         if hasattr(self.model, "sampler"):
@@ -979,9 +989,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             with suppress(Exception):
                 state.pending_speech_response_open = False
             return
+        # A seeded prefix can open the response before tts_bos is sampled.
+        # Keep its pending input until the first content token in either case.
         if (
             sampled == tts_bos_id
-            and getattr(state, "current_turn_ended", True)
+            and (getattr(state, "current_turn_ended", True) or getattr(state, "pending_speech_response_open", False))
             and getattr(state, "pending_speech_context", False)
         ):
             with suppress(Exception):
