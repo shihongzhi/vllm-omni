@@ -979,3 +979,58 @@ def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples
             {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )
+
+
+# Mirrors the Thinker/Talker lengths in test_qwen3_omni_no_async_chunk.json.
+_FIXED_SAMPLING = {
+    "sampling_params_list": [{"min_tokens": 900, "max_tokens": 900}, {"min_tokens": 1536, "max_tokens": 1536}]
+}
+_FIXED_OK = {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 1536}}
+
+
+@pytest.mark.parametrize("extra_body_key", ["extra_body", "extra-body"])
+def test_fixed_stage_workload_accepts_exact_lengths(extra_body_key, capsys):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {"completed": 2, "failed": 0, "request_stage_metrics": [_FIXED_OK, _FIXED_OK]},
+        {extra_body_key: _FIXED_SAMPLING},
+        2,
+    )
+    assert "Fixed stage workload OK: 2 requests, num_tokens_out stage 0=900, stage 1=1536" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "snapshots",
+    [
+        None,
+        [],
+        [_FIXED_OK],
+        [_FIXED_OK, None],
+        [_FIXED_OK, {}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 486}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 1537}}],
+        [_FIXED_OK, {"1": {"num_tokens_out": 1536}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 512}, "1": {"num_tokens_out": 1536}}],
+    ],
+)
+def test_fixed_stage_workload_rejects_missing_or_wrong_lengths(snapshots):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Fixed stage workload"):
+        assert_result({"completed": 2, "request_stage_metrics": snapshots}, {"extra_body": _FIXED_SAMPLING}, 2)
+
+
+def test_fixed_stage_workload_rejects_request_failures():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Request failures"):
+        assert_result({"completed": 1, "failed": 1}, {}, 2)
+
+
+@pytest.mark.parametrize("extra_body", [{}, {"sampling_params_list": [{"max_tokens": 900}]}])
+def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
