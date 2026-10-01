@@ -557,6 +557,38 @@ def test_the_decode_graph_captures_into_the_shared_platform_pool(monkeypatch):
     assert not hasattr(runner, "_pool"), "the runner still keeps a pool of its own"
 
 
+@cuda_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_a_reallocation_drops_the_superseded_generation():
+    """A graph keyed to an old generation can never be selected again.
+
+    Correctness does not care whether it is held or dropped, but a long-lived
+    runner would collect one set of graphs per growth event and hold each until
+    a sleep-level-2 release. The reallocation is the point to drop them: the
+    growth happens once, and the next short request recaptures only its own
+    tier.
+    """
+    from vllm_omni.diffusion.models.sensenova_u1.paged_decode import DecodeGraphRunner
+
+    dev = torch.device("cuda")
+    cache = PagedDecodeCache.from_dynamic_cache(_dyn_cache(8, dev), LAYERS, dev, torch.float32)
+    runner = DecodeGraphRunner(_StubLM(dev), cache, dev)
+    runner.step(0, 0)
+    assert set(runner._graphs) == {(512, 0)}
+
+    # A request outgrows the stash: new buffers, generation bump.
+    cache.grow(600)
+    cache.set_length(600)
+    runner.step(0, 0)
+    assert set(runner._graphs) == {(1024, 1)}, "the superseded generation was held"
+
+    # The next short request recaptures its tier for the new generation.
+    cache.set_length(9)
+    runner.step(0, 0)
+    assert set(runner._graphs) == {(1024, 1), (512, 1)}
+    assert runner.captures == 3
+
+
 # ---------------------------------------------------------------------------
 # The cache is only worth anything if production actually reaches it, and the
 # kwargs it needs are not in every wheel that exports the kernel. The tests
