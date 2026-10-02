@@ -79,6 +79,26 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
+    """Let a TP1 in-process runner that decodes first audio deliver it as its own output."""
+    if not isinstance(model_executor, UniProcExecutor):
+        return False
+    worker = getattr(getattr(model_executor, "driver_worker", None), "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    model_state = getattr(model_runner, "model_state", None)
+    model = getattr(model_runner, "model", None)
+    decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
+        getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
+    )
+    if not decodes_audio or not hasattr(model_state, "set_first_audio_sink"):
+        return False
+    from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
+
+    assert model_state is not None
+    model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
+    return True
+
+
 def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
     """Bind the TP1 in-process runner control plane directly to its scheduler."""
     if not isinstance(model_executor, UniProcExecutor):
@@ -107,8 +127,24 @@ class StageEngineCoreProc(EngineCoreProc):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def omni_release_request_resources(self, request_ids: list[str]) -> None:
+        """Release this stage's inter-stage transfer resources for *request_ids*.
+
+        Invoked over the UTILITY channel by the orchestrator once every stage
+        has finished with the request. Idempotent and safe for unknown ids.
+        """
+        adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        for request_id in request_ids or ():
+            try:
+                adapter.release_shm_resources(request_id)
+            except Exception as e:
+                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

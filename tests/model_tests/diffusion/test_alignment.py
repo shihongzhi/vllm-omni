@@ -32,6 +32,8 @@ EXCLUDED_MODELS = [
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
     "WanPipeline",
+    # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
+    "SeedVR2Pipeline",
     "WanDMDPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
@@ -60,7 +62,6 @@ EXCLUDED_MODELS = [
     "ErnieImagePipeline",
     "NextStep11Pipeline",
     "FluxDMD2Pipeline",
-    "Krea2Pipeline",
     "QwenImageDMD2Pipeline",
     "OmniGen2Pipeline",
     "HeliosPipeline",
