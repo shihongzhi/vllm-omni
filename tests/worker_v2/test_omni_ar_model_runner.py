@@ -15,6 +15,7 @@ from vllm.v1.outputs import RoutedExpertsTensors
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 
 import vllm_omni.worker_v2.omni_ar_model_runner as omni_ar_model_runner
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
 from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 
@@ -144,6 +145,7 @@ def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
     runner.model = SimpleNamespace()
     runner._async_mm_snapshot_slots, runner._async_mm_snapshot_events = [{}], [None]
     runner._async_mm_snapshot_pending, runner._async_mm_snapshot_cursor = [False], 0
+    runner._last_multimodal_snapshot_slot = None
     waited: list[object] = []
     runner.main_stream = SimpleNamespace(wait_event=waited.append)
     source = torch.tensor([[7, 8]], dtype=torch.long)
@@ -159,6 +161,35 @@ def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
     runner._release_multimodal_snapshot(0, copy_event := object())
     runner._retain_multimodal_outputs({"codes": {"audio": torch.zeros(1, 2)}})
     assert waited == [copy_event]
+
+
+def test_producer_snapshot_is_not_repacked() -> None:
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace()
+    runner._async_mm_snapshot_slots, runner._async_mm_snapshot_events = [{}], [None]
+    runner._async_mm_snapshot_pending, runner._async_mm_snapshot_cursor = [False], 0
+    runner._last_multimodal_snapshot_slot = None
+    source = torch.tensor([[7, 8]], dtype=torch.float32)
+    snapshot = pack_output_snapshot({"audio": source}, {}, max_buckets=1)
+    assert isinstance(snapshot, PackedOutputSnapshot)
+
+    retained = runner._retain_multimodal_outputs(snapshot)
+
+    assert retained is snapshot
+    assert runner._last_multimodal_snapshot_slot is None
+    assert runner._async_mm_snapshot_pending == [False]
+
+
+def test_fresh_per_step_outputs_are_not_repacked() -> None:
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace(mm_outputs_fresh_per_step=True)
+    runner._last_multimodal_snapshot_slot = None
+    outputs = {"model_outputs": torch.ones(2, 4)}
+
+    assert runner._retain_multimodal_outputs(outputs) is outputs
+    assert runner._last_multimodal_snapshot_slot is None
 
 
 def test_snapshot_slots_bounded_by_shape_and_packed_grouping_isolation(monkeypatch) -> None:

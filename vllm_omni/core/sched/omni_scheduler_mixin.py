@@ -331,13 +331,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             # ready-chunk marker remains until scheduler admission succeeds.
             replaced_ids.discard(request_id)
 
-    def _consume_pending_connector_output(self, model_mode: str) -> None:
-        """Drain ``self._latest_omni_connector_output`` into the coordinator.
-
-        Called at the top of every ``schedule()`` cycle.  Identical between
-        AR and generation schedulers except for the ``model_mode`` argument
-        forwarded to ``update_request_metadata``.
-        """
+    def _drain_omni_connector_outputs(self) -> list[OmniConnectorOutput]:
+        """Collect control messages in order, without changing request state."""
         connector_outputs: list[OmniConnectorOutput] = []
         inbox = getattr(self, "_omni_connector_output_inbox", None)
         if inbox is not None:
@@ -350,6 +345,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._latest_omni_connector_output = None
         if connector_output is not None:
             connector_outputs.append(connector_output)
+        return connector_outputs
+
+    def _consume_pending_connector_output(self, model_mode: str) -> None:
+        """Drain input notifications into the coordinator on the scheduler thread."""
+        connector_outputs = self._drain_omni_connector_outputs()
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return

@@ -138,6 +138,23 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
     # ------------------------------------------------------------------
 
+    def sample(self, hidden_states, input_batch, grammar_output):
+        # An explicitly declared model-state hook may return already determined
+        # tokens. Unsupported sampling features retain the upstream path.
+        sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)
+        if (
+            sample_determined is not None
+            and grammar_output is None
+            and self.batch_sharder is None
+            and self.pp_handler is None
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_reqs > 0
+        ):
+            output = sample_determined(self.model_state, input_batch, self.sampler)
+            if output is not None:
+                return output, output.num_sampled, output.num_rejected
+        return super().sample(hidden_states, input_batch, grammar_output)
+
     @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
@@ -310,6 +327,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if getattr(self.model, "mm_outputs_fresh_per_step", False):
             # Freshly allocated each step and filled after sampling; nothing
             # overwrites them before the host copy.
+            return outputs
+        # A producer-side PackedOutputSnapshot already owns its device slabs
+        # for this forward and carries the event that makes them visible to
+        # the output copy stream. Repacking it would add a second GPU copy.
+        if isinstance(outputs, PackedOutputSnapshot):
             return outputs
         slot_index = self._async_mm_snapshot_cursor
         if self._async_mm_snapshot_pending[slot_index]:
@@ -567,6 +589,8 @@ def _async_copy_mm(
     if not mm_outputs:
         return {}
     if isinstance(mm_outputs, PackedOutputSnapshot):
+        if mm_outputs.producer_event is not None:
+            mm_outputs.producer_event.wait(copy_stream)
         return mm_outputs.copy_to_cpu(
             lambda tensor: _async_copy_tensor(tensor, copy_stream=copy_stream, pin_memory=pin_memory)
         )
