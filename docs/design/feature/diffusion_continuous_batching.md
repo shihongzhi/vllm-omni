@@ -196,9 +196,17 @@ Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
 for its validated configuration. Helios supports only a single active step
 request and must use `max_num_seqs=1`.
 SenseNova-U1 and U1.5 share a pipeline that implements step execution together
-with `SupportsResumablePrepare`, and it also requires `max_num_seqs=1`: its think
-and text decoding run on a model-local paged cache that holds one sequence at a
-time, and the pipeline rejects a larger value at startup.
+with `SupportsResumablePrepare`, and U1.5 batches its step waves: a wave carries
+several requests through one `denoise_step` call, one transformer forward per
+request with request-local KV caches and CFG branches. The think and text
+decode phases run on a model-local paged cache that holds one sequence at a
+time, so the pipeline serializes those phases instead of capping
+`max_num_seqs`: at most one decode is live at a time, and a request that
+arrives while another one is decoding keeps its whole prepare phase queued
+while its peers keep stepping through their denoise waves. Requests whose
+derived CFG switch differs (`extra_args.cfg_scale` on vs off) are separated at
+admission through the batch-compatibility key, because the shared batch state
+admits only one CFG switch per wave.
 
 ### Continuous Batching
 

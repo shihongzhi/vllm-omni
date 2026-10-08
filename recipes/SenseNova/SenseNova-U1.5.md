@@ -113,15 +113,28 @@ therefore interleaves concurrent requests' denoise steps and admits or cancels
 requests at wave boundaries (abort latency is at most one step) without
 changing per-step kernel efficiency. The think/text decode phases serialize on
 the model-local paged cache (one decode in flight; the rest queue), while
-denoise waves batch. Step execution cannot be combined with a diffusion cache
-backend (TeaCache, Cache-DiT). See
+denoise waves batch. Waves group requests by their CFG switch: a request with
+CFG disabled (`cfg_scale=1`) and one with CFG enabled run in separate waves,
+each keeping its own CFG branches. Step execution cannot be combined with a
+diffusion cache backend (TeaCache, Cache-DiT). See
 [Diffusion Execution Modes](../../docs/user_guide/diffusion/execution_modes.md#step-execution).
 
 #### Measured step execution (1x A800 80GB, 1024x1024, 25 steps, BF16)
 
+The numbers below were measured on the standalone B4 stack, before it was
+restacked on the resumable-prepare base (#7730). The restack does not change
+the wave contract — each wave still runs one transformer forward per request
+over request-local caches — and the batching test suite re-pins the behavioral
+contract on the current stack (solo-vs-batched call-sequence and pixel parity,
+mixed t2i/it2i and unequal step counts, mid-flight admission, abort isolation
+with peer preservation, and the release-before-conversion cleanup order, all
+through the real `DiffusionModelRunner` and the real `StepScheduler`
+admission path). The saved images, throughput numbers, and client-observed
+abort latency predate the restack; re-run them before quoting these figures.
+
 Pixel consistency: for t2i (think off), t2i (think on), and it2i, the step
 path and the complete-request path with the same seed produce bit-identical
-PNG output (matching SHA-256 digests).
+PNG output (matching SHA-256 digests) — measured pre-restack.
 
 | Scenario | Result |
 | --- | --- |
