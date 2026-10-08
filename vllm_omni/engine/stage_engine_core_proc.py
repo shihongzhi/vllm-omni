@@ -16,7 +16,8 @@ import signal
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
-from vllm.logger import init_logger
+from vllm.config import VllmConfig
+from vllm.logger import configure_logging, init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -80,8 +81,11 @@ def _signal_exit_code(signum: int) -> int:
 
 
 def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
-    """Let a TP1 in-process runner that decodes first audio deliver it as its own output."""
+    """Bind in-process first audio to the generic engine output sink."""
     if not isinstance(model_executor, UniProcExecutor):
+        return False
+    parallel_config = model_executor.vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 1 or parallel_config.pipeline_parallel_size != 1:
         return False
     worker = getattr(getattr(model_executor, "driver_worker", None), "worker", None)
     model_runner = getattr(worker, "model_runner", None)
@@ -90,12 +94,23 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
         getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
     )
-    if not decodes_audio or not hasattr(model_state, "set_first_audio_sink"):
-        return False
     from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
 
-    assert model_state is not None
-    model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
+    if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
+        assert model_state is not None
+        model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
+        return True
+    data_plane = getattr(model_runner, "_omni_data_plane", None)
+    get_model = getattr(model_runner, "get_model", None)
+    if data_plane is None or not callable(get_model):
+        return False
+    bind = getattr(get_model(), "bind_first_chunk_fast_path", None)
+    if not callable(bind):
+        return False
+    hook = bind(engine_output_queue_sink(output_queue, scheduler, upstream_first_audio=False))
+    if hook is None:
+        return False
+    data_plane.set_first_chunk_hook(hook)
     return True
 
 
@@ -181,6 +196,10 @@ class StageEngineCoreProc(EngineCoreProc):
             logging / metrics only.
         """
         signal_callback: SignalCallback | None = None
+        vllm_config: VllmConfig = kwargs["vllm_config"]
+        if logging_config := getattr(vllm_config, "logging_config", None):
+            configure_logging(logging_config)
+
         maybe_register_config_serialize_by_value()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
