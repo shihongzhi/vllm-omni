@@ -776,27 +776,66 @@ class TestCfgSwitchAdmission:
     """
 
     @staticmethod
-    def _request(req_id: str, *, cfg_scale: float | None = None):
+    def _request(
+        req_id: str,
+        *,
+        cfg_scale: float | None = None,
+        step_execution: bool = False,
+        modalities: list[str] | None = None,
+        extra_args: dict | None = None,
+        steps: int | None = 3,
+    ):
         from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
             get_sensenova_u1_pre_process_func,
         )
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        extra_args = {} if cfg_scale is None else {"cfg_scale": cfg_scale}
+        merged_extra = {} if cfg_scale is None else {"cfg_scale": cfg_scale}
+        if extra_args:
+            merged_extra.update(extra_args)
         request = OmniDiffusionRequest(
-            prompt={"prompt": "draw the sky", "modalities": ["image"]},
+            prompt={"prompt": "draw the sky", "modalities": modalities or ["image"]},
             request_id=req_id,
             sampling_params=OmniDiffusionSamplingParams(
-                num_inference_steps=3, seed=42, width=32, height=32, extra_args=extra_args
+                num_inference_steps=steps, seed=42, width=32, height=32, extra_args=merged_extra
             ),
         )
-        return get_sensenova_u1_pre_process_func(types.SimpleNamespace())(request)
+        return get_sensenova_u1_pre_process_func(
+            types.SimpleNamespace(step_execution=step_execution)
+        )(request)
 
     def test_pre_process_publishes_derived_cfg_switch(self):
         assert self._request("a").batch_compatibility_key == ("sensenova_u1_cfg", True)
         assert self._request("b", cfg_scale=7.0).batch_compatibility_key == ("sensenova_u1_cfg", True)
         assert self._request("c", cfg_scale=1.0).batch_compatibility_key == ("sensenova_u1_cfg", False)
+
+    def test_pre_process_gives_step_text_requests_a_prepare_budget(self):
+        """A text request spends its whole life in the prepare phase; the step
+        scheduler needs a positive total-steps bound to admit it, and the
+        serving layer only maps num_inference_steps for image requests."""
+        from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+
+        # Default budget: the text decode max_tokens plus the tick that
+        # begins it — the same bound prepare_steps_remaining reports.
+        text = self._request(
+            "t",
+            step_execution=True,
+            modalities=["text"],
+            extra_args={"max_tokens": 64},
+            steps=None,
+        )
+        assert text.sampling_params.num_inference_steps == 65
+        scheduler = StepScheduler()
+        scheduler.initialize(types.SimpleNamespace(max_num_seqs=2))
+        assert scheduler.add_request(text) == "t"  # no total-steps assertion
+
+        # Explicit steps stay untouched, and request-mode requests are not
+        # given a bound.
+        image = self._request("i", step_execution=True)
+        assert image.sampling_params.num_inference_steps == 3
+        text_request_mode = self._request("r", modalities=["text"])
+        assert text_request_mode.sampling_params.num_inference_steps == 3
 
     def test_shared_batch_state_rejects_mixed_derived_flags(self):
         from vllm_omni.diffusion.worker.input_batch import _prepare_cfg_scalars

@@ -441,9 +441,16 @@ def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
     everything else — geometry, step count, seeds — keeps batching freely, and
     the per-request CFG scales themselves stay request-local because each
     request runs its own forward with its own CFG branches.
+
+    A text request under step execution also needs a total-steps bound the
+    scheduler can validate: its whole life is the resumable prepare phase (one
+    token per tick), and the serving layer only maps ``num_inference_steps``
+    for image requests. Give it the same budget its decode loop draws from —
+    the ``extra_args.max_tokens`` default plus the tick that begins it, which
+    is exactly what ``prepare_steps_remaining`` reports while it is queued.
     """
 
-    del od_config
+    step_execution = bool(getattr(od_config, "step_execution", False))
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         extra_args = request.sampling_params.extra_args or {}
@@ -451,6 +458,13 @@ def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
         # ``prepare_encode``, so the key cannot drift from the derived flag.
         cfg_scale = float(extra_args.get("cfg_scale", 4.0))
         request.batch_compatibility_key = ("sensenova_u1_cfg", cfg_scale > 1)
+        if (
+            step_execution
+            and request.sampling_params.num_inference_steps is None
+            and isinstance(request.prompt, dict)
+            and "text" in (request.prompt.get("modalities") or [])
+        ):
+            request.sampling_params.num_inference_steps = 1 + int(extra_args.get("max_tokens", 512))
         return request
 
     return pre_process_func
