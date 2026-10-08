@@ -752,7 +752,6 @@ class TestThroughTheRunner:
 
 
 def _make_runner_output(req_id: str, step_index: int, *, finished: bool = False):
-    from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.worker.utils import RunnerOutput
 
     return RunnerOutput(
@@ -778,11 +777,11 @@ class TestCfgSwitchAdmission:
 
     @staticmethod
     def _request(req_id: str, *, cfg_scale: float | None = None):
-        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
         from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
             get_sensenova_u1_pre_process_func,
         )
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         extra_args = {} if cfg_scale is None else {"cfg_scale": cfg_scale}
         request = OmniDiffusionRequest(
