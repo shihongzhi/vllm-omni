@@ -719,3 +719,105 @@ class TestThroughTheRunner:
             assert request_output is not None and request_output.finished is True
             assert request_output.result.output["payload"]["image"] is not None
             assert rid not in runner.state_cache
+
+
+# ---------------------------------------------------------------------------
+# CFG admission through the real scheduler
+# ---------------------------------------------------------------------------
+
+
+def _make_runner_output(req_id: str, step_index: int, *, finished: bool = False):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+    return RunnerOutput(
+        request_id=req_id,
+        step_index=step_index,
+        finished=finished,
+        result=None,
+    )
+
+
+class TestCfgSwitchAdmission:
+    """The derived CFG switch rides the scheduler's compatibility key.
+
+    ``extra_args.cfg_scale`` is invisible to the generic sampling-params key,
+    so a CFG-off and a CFG-on request with identical standard fields look
+    batch-compatible. ``prepare_encode`` derives different ``do_true_cfg``
+    flags for them, and the shared batch state
+    (``InputBatch._prepare_cfg_scalars``) rejects the mixed wave before any
+    denoise runs. The pre-process function publishes the derived switch as the
+    batch-compatibility key, so the scheduler separates such requests at
+    admission instead; requests whose switches agree still batch.
+    """
+
+    @staticmethod
+    def _request(req_id: str, *, cfg_scale: float | None = None):
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+        from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+            get_sensenova_u1_pre_process_func,
+        )
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+        extra_args = {} if cfg_scale is None else {"cfg_scale": cfg_scale}
+        request = OmniDiffusionRequest(
+            prompt={"prompt": "draw the sky", "modalities": ["image"]},
+            request_id=req_id,
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=3, seed=42, width=32, height=32, extra_args=extra_args
+            ),
+        )
+        return get_sensenova_u1_pre_process_func(types.SimpleNamespace())(request)
+
+    def test_pre_process_publishes_derived_cfg_switch(self):
+        assert self._request("a").batch_compatibility_key == ("sensenova_u1_cfg", True)
+        assert self._request("b", cfg_scale=7.0).batch_compatibility_key == ("sensenova_u1_cfg", True)
+        assert self._request("c", cfg_scale=1.0).batch_compatibility_key == ("sensenova_u1_cfg", False)
+
+    def test_shared_batch_state_rejects_mixed_derived_flags(self):
+        from vllm_omni.diffusion.worker.input_batch import _prepare_cfg_scalars
+
+        def _state(*, do_true_cfg: bool):
+            request = self._request("s", cfg_scale=4.0 if do_true_cfg else 1.0)
+            return types.SimpleNamespace(sampling=request.sampling_params, do_true_cfg=do_true_cfg)
+
+        # The root cause this key exists for: the worker's shared CFG scalars
+        # fail a wave whose requests derived different CFG switches.
+        assert _prepare_cfg_scalars([_state(do_true_cfg=True), _state(do_true_cfg=True)]) == (True, 4.0, False)
+        with pytest.raises(ValueError, match="Mixed CFG"):
+            _prepare_cfg_scalars([_state(do_true_cfg=True), _state(do_true_cfg=False)])
+
+    def test_scheduler_separates_cfg_off_from_cfg_on(self):
+        from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+
+        scheduler = StepScheduler()
+        scheduler.initialize(types.SimpleNamespace(max_num_seqs=2))
+        req_a = scheduler.add_request(self._request("a", cfg_scale=4.0))
+        req_b = scheduler.add_request(self._request("b", cfg_scale=1.0))
+
+        first = scheduler.schedule()
+        assert [req.request_id for req in first.scheduled_new_reqs] == [req_a]
+        assert first.num_waiting_reqs == 1
+
+        # b stays waiting while a's wave keeps running...
+        scheduler.update_from_output(first, _make_runner_output(req_a, step_index=1))
+        second = scheduler.schedule()
+        assert list(second.scheduled_cached_reqs.request_ids) == [req_a]
+        assert second.num_waiting_reqs == 1
+
+        # ...and is admitted only once a's wave has drained.
+        scheduler.update_from_output(second, _make_runner_output(req_a, step_index=3, finished=True))
+        third = scheduler.schedule()
+        assert [req.request_id for req in third.scheduled_new_reqs] == [req_b]
+
+    def test_scheduler_batches_requests_with_the_same_switch(self):
+        from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+
+        scheduler = StepScheduler()
+        scheduler.initialize(types.SimpleNamespace(max_num_seqs=2))
+        req_a = scheduler.add_request(self._request("a", cfg_scale=4.0))
+        req_b = scheduler.add_request(self._request("b", cfg_scale=7.0))
+
+        output = scheduler.schedule()
+        assert sorted(req.request_id for req in output.scheduled_new_reqs) == sorted([req_a, req_b])
+        assert output.num_waiting_reqs == 0

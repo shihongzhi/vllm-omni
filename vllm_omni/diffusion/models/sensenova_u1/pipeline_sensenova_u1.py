@@ -427,6 +427,35 @@ def get_sensenova_u1_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
+    """Publish the derived true-CFG switch as the batch-compatibility key.
+
+    The pipeline derives each request's true-CFG switch from
+    ``extra_args.cfg_scale`` (``prepare_encode`` stores it on the step state),
+    a request-local knob the generic sampling-params key cannot see: two
+    requests with identical standard sampling fields can still differ in CFG
+    being on or off. The worker validates the shared batch state for one CFG
+    switch (``InputBatch._prepare_cfg_scalars``), so a scheduler that admits
+    both into one wave fails the whole wave before any denoise runs. Carrying
+    the switch in the compatibility key separates such requests at admission;
+    everything else — geometry, step count, seeds — keeps batching freely, and
+    the per-request CFG scales themselves stay request-local because each
+    request runs its own forward with its own CFG branches.
+    """
+
+    del od_config
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        extra_args = request.sampling_params.extra_args or {}
+        # Same resolution and comparison as ``_parse_request`` /
+        # ``prepare_encode``, so the key cannot drift from the derived flag.
+        cfg_scale = float(extra_args.get("cfg_scale", 4.0))
+        request.batch_compatibility_key = ("sensenova_u1_cfg", cfg_scale > 1)
+        return request
+
+    return pre_process_func
+
+
 # ---------------------------------------------------------------------------
 # CFG helpers
 # ---------------------------------------------------------------------------
