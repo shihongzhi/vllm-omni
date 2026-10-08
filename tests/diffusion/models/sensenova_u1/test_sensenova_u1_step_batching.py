@@ -573,6 +573,31 @@ def test_post_decode_releases_caches_even_on_decode_failure(monkeypatch):
     assert released == [cond, uncond, cond2, uncond2]
 
 
+def test_post_decode_releases_caches_before_converting(monkeypatch):
+    """The image conversion allocates (``_to_pil``), so the request's CFG
+    caches must already be gone when it runs — the same order the
+    request-mode loop uses (``_denoising_output``)."""
+    pipe = _make_setup()
+    released = []
+    monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: released.append(cache))
+    ns, caches = _make_ns(), _make_caches()
+    cond, uncond = caches["cond"], caches["uncond"]
+    req = _build_step_request(ns, caches)
+
+    state_at_conversion: dict = {}
+
+    def recording_decode(image_prediction, think_text=""):
+        state_at_conversion["caches_left"] = dict(caches)
+        state_at_conversion["released"] = list(released)
+        return SenseNovaU1Pipeline._build_diffusion_output(pipe, image_prediction, think_text)
+
+    pipe._build_diffusion_output = recording_decode
+    pipe.post_decode(req)
+
+    assert state_at_conversion["caches_left"] == {}
+    assert state_at_conversion["released"] == [cond, uncond]
+
+
 def test_step_batch_noise_is_per_request():
     """Denoising noise is seeded per request, so concurrent requests stay
     independent: same seed reproduces, different seeds differ."""

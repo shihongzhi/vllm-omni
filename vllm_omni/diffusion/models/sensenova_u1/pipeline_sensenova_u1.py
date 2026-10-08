@@ -2111,10 +2111,15 @@ class SenseNovaU1Pipeline(
         try:
             if step.mode == "text":
                 return step.output
+            # Release before converting, as the request-mode loop does
+            # (``_denoising_output``): the ``_to_pil`` allocations must not
+            # overlap the request's live CFG cache reservations.
+            _release_denoise_caches(step.caches)
             return self._build_diffusion_output(state.latents, step.think_text)
         finally:
-            # Release even when the decode itself raises, so a failed request
-            # costs no more than an aborted one.
+            # Backstop release for every other path (a text request, or a
+            # conversion that raised), so a failed request costs no more than
+            # an aborted one. Idempotent with the release above.
             self.release_step_state(state)
             state.extra.pop(self._STEP_KEY, None)
 
