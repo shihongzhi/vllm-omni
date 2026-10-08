@@ -121,28 +121,21 @@ diffusion cache backend (TeaCache, Cache-DiT). See
 
 #### Measured step execution (1x A800 80GB, 1024x1024, 25 steps, BF16)
 
-The numbers below were measured on the standalone B4 stack, before it was
-restacked on the resumable-prepare base (#7730). The restack does not change
-the wave contract — each wave still runs one transformer forward per request
-over request-local caches — and the batching test suite re-pins the behavioral
-contract on the current stack (solo-vs-batched call-sequence and pixel parity,
-mixed t2i/it2i and unequal step counts, mid-flight admission, abort isolation
-with peer preservation, and the release-before-conversion cleanup order, all
-through the real `DiffusionModelRunner` and the real `StepScheduler`
-admission path). The saved images, throughput numbers, and client-observed
-abort latency predate the restack; re-run them before quoting these figures.
-
-Pixel consistency: for t2i (think off), t2i (think on), and it2i, the step
-path and the complete-request path with the same seed produce bit-identical
-PNG output (matching SHA-256 digests) — measured pre-restack.
+Measured on the reviewed stack (restacked on the resumable-prepare base),
+driving a live `--step-execution --max-num-seqs 4` server through the OpenAI
+chat endpoint. Pixel consistency: for t2i (think off), t2i (think on), and
+it2i, the step path and the complete-request path (same server, same seed)
+produce bit-identical PNG output — matching SHA-256 digests.
 
 | Scenario | Result |
 | --- | --- |
-| Single request, step mode | 5.23 s (vs 5.31 s complete-request) |
-| 4 concurrent requests, `--max-num-seqs 4` | 20.69 s total, 0.193 img/s, all 4 images produced |
-| 4 concurrent requests, `--max-num-seqs 1` (queued) | 20.72 s total, 0.192 img/s |
+| Single request, step mode | 5.85 s (vs 5.90 s complete-request) |
+| 4 concurrent requests, `--max-num-seqs 4` | 22.81 s total, 0.175 img/s, all 4 images produced |
+| 4 concurrent requests, `--max-num-seqs 1` (queued) | 21.43 s total, 0.187 img/s |
 | Mid-flight admission (requests staggered 1.5 s) | all 4 requests complete; late arrivals join mid-denoise |
-| Abort mid-denoise (2 peers in flight) | 2 ms client-observed latency; victim aborts without an image; both peers complete |
+| Abort mid-denoise (2 peers in flight) | 0.7 ms client-observed disconnect; victim aborts without an image; both peers complete |
+| CFG on + CFG off concurrent (`cfg_scale=4` / `cfg_scale=1`) | both complete; separate waves, each request keeps its own CFG branches |
+| Text request on the step path | completes inside its prepare phase (think + answer) |
 
 Batched total time matches queued serial time — each wave still runs one
 forward per request — so keep `--max-num-seqs 1` for pure throughput; raise it
