@@ -801,9 +801,7 @@ class TestCfgSwitchAdmission:
                 num_inference_steps=steps, seed=42, width=32, height=32, extra_args=merged_extra
             ),
         )
-        return get_sensenova_u1_pre_process_func(
-            types.SimpleNamespace(step_execution=step_execution)
-        )(request)
+        return get_sensenova_u1_pre_process_func(types.SimpleNamespace(step_execution=step_execution))(request)
 
     def test_pre_process_publishes_derived_cfg_switch(self):
         assert self._request("a").batch_compatibility_key == ("sensenova_u1_cfg", True)
