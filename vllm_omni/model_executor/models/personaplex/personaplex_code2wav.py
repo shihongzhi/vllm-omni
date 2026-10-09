@@ -83,6 +83,7 @@ class PersonaPlexCode2Wav(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
+        self._async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
         self.config = vllm_config.model_config.hf_config
 
         # Runner-facing capability flags, matching Qwen3TTSCode2Wav so the
@@ -108,6 +109,7 @@ class PersonaPlexCode2Wav(nn.Module):
         self._mimi_device: torch.device | None = None
         self._request_codes: dict[str, torch.Tensor] = {}
         self._request_codec_slots: dict[str, int] = {}
+        self._consumed_full_payload_requests: set[str] = set()
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -173,10 +175,12 @@ class PersonaPlexCode2Wav(nn.Module):
         """Decode flat codebook-major codec ids into PCM via Mimi.
 
         ``input_ids`` per request is ``[k * F]`` (codebook-major), where ``k``
-        is ``self._num_codebooks``. The connector may send either a new delta
-        chunk or the cumulative prefix of a resumable request. Request-local
-        code history identifies the new suffix, and the streaming Mimi decoder
-        consumes each new frame exactly once.
+        is ``self._num_codebooks``. Async inputs contain newly generated delta
+        frames. Sync connector payloads contain the full sequence and may
+        persist across forwards, so they are consumed once per request. A
+        cumulative-prefix payload is also accepted: request-local code history
+        identifies the new suffix, which the streaming decoder consumes
+        exactly once.
         """
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
@@ -228,6 +232,10 @@ class PersonaPlexCode2Wav(nn.Module):
             frames = n // k
             codes_kf = flat.reshape(k, frames)
             state_id = state_ids[i]
+            if not self._async_chunk and state_id is not None:
+                if state_id in self._consumed_full_payload_requests:
+                    continue
+                self._consumed_full_payload_requests.add(state_id)
             delta_kf = self._new_code_suffix(state_id, codes_kf)
             if delta_kf.shape[1] == 0:
                 continue
@@ -349,6 +357,7 @@ class PersonaPlexCode2Wav(nn.Module):
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._request_codes.pop(state_id, None)
+            self._consumed_full_payload_requests.discard(state_id)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()
             if slot is not None and slot < len(codecs):
@@ -416,6 +425,28 @@ class PersonaPlexCode2Wav(nn.Module):
             ).eval()
             for _ in range(self._max_codec_sessions)
         ]
+        if getattr(self.config, "mimi_cuda_graphs", False):
+            # Each decoder is leased per request and reset in place, so its B=1
+            # graphs stay valid. Deltas arrive as the first single frame and then
+            # full chunks, so those two frame counts are recorded; other counts
+            # run eagerly. The graphs replay one at a time on this stage's stream
+            # and copy their output, so they share one pool.
+            pool = torch.cuda.graph_pool_handle() if torch.device(str(device)).type == "cuda" else None
+            captured = 0
+            for codec in codecs:
+                codec.streaming_init(1)
+                captured += bool(
+                    codec.capture_cuda_graphs(
+                        encode=False,
+                        decode_frame_counts=(1, _MIMI_DECODE_BATCH_FRAMES),
+                        pool=pool,
+                    )
+                )
+            logger.info(
+                "PersonaPlex Code2Wav replays Mimi decode from CUDA graphs on %d/%d stream(s)",
+                captured,
+                len(codecs),
+            )
         self._set_mimi_codecs(codecs)
         self._mimi_device = torch.device(str(device))
         reported_sr = getattr(codecs[0].model.config, "sampling_rate", None)

@@ -1169,7 +1169,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._payload_finished(payload_data),
             )
 
-        self._get_req_chunk[req_id] += 1
+        with self._lock:
+            if self._async_chunk and request is not None and req_id not in self._pending_load_reqs:
+                # A connector get can return after cancellation removed its
+                # receiver. Do not recreate delivery state for that request.
+                return False
+            self._get_req_chunk[req_id] += 1
 
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
@@ -1182,6 +1187,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 payload_consumable = self._payload_is_consumable(payload_data)
 
             with self._lock:
+                if request is not None and req_id not in self._pending_load_reqs:
+                    # Receive may overlap cancellation; do not republish
+                    # readiness after the request was torn down.
+                    return False
                 if self._model_mode == "ar":
                     # Accumulation, staging, and model-side consume/ack share
                     # this lock. Keeping the transition atomic prevents the
@@ -1280,11 +1289,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             payload_kwarg: pooling_output,
             "request": request,
         }
-        supports_is_finished = getattr(
-            self,
-            "_custom_process_supports_is_finished",
-            self._custom_process_supports_is_finished_kwarg(),
-        )
+        # The signature check is cached at initialization; never re-inspect
+        # the hook for every request of every model step.
+        supports_is_finished = getattr(self, "_custom_process_supports_is_finished", None)
+        if supports_is_finished is None:
+            supports_is_finished = self._custom_process_supports_is_finished_kwarg()
+            self._custom_process_supports_is_finished = supports_is_finished
         is_finished_fn = getattr(request, "is_finished", None)
         if callable(is_finished_fn):
             try:

@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -258,6 +259,9 @@ def _image_to_tensor(image: Image.Image) -> torch.Tensor:
 def _frames_to_tensor(frames: Sequence[Any]) -> torch.Tensor:
     if len(frames) == 0:
         raise ValueError("MiniMax H3 reference video must contain frames")
+    if isinstance(frames, np.ndarray) and frames.dtype == np.uint8 and frames.ndim == 4 and frames.shape[-1] == 3:
+        # Keep the existing owned, contiguous output without converting each RGB frame through PIL.
+        return torch.from_numpy(np.array(frames, copy=True, order="C"))
     return torch.stack(
         [
             _image_to_tensor(frame if isinstance(frame, Image.Image) else Image.fromarray(np.asarray(frame)))
@@ -294,8 +298,9 @@ def _canonical_video_edit_mask(
     latent_t: int,
     latent_h: int,
     latent_w: int,
+    num_frames: int,
 ) -> torch.Tensor:
-    """Normalize every accepted request shape to one full latent grid."""
+    """Normalize every accepted request shape, including raw frame-space masks, to one full latent grid."""
     mask = _edit_mask(value, name="video_noise_mask")
     token_shape = (latent_t, latent_h // 2, latent_w // 2)
     full_shape = (latent_t, latent_h, latent_w)
@@ -313,10 +318,61 @@ def _canonical_video_edit_mask(
         if not candidate.ndim or candidate.shape[0] != 1:
             break
         candidate = candidate.squeeze(0)
+    if candidate.ndim in (2, 3):
+        return _resize_video_edit_mask(
+            candidate,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            num_frames=num_frames,
+        )
     raise OmniClientError(
         "MiniMax H3 video_noise_mask shape must be "
-        f"scalar, ({row_count},), {token_shape}, or {full_shape}; got {tuple(mask.shape)}"
+        f"scalar, ({row_count},), {token_shape}, {full_shape}, [H, W], or [T, H, W]; got {tuple(mask.shape)}"
     )
+
+
+def _resize_video_edit_mask(
+    mask: torch.Tensor,
+    *,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    num_frames: int,
+) -> torch.Tensor:
+    """Resize a raw ``[H, W]`` or frame-space ``[T, H, W]`` mask to ``[latent_t, latent_h, latent_w]``."""
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    grid = torch.nn.functional.interpolate(mask.unsqueeze(1), size=(latent_h, latent_w), mode="area").squeeze(1)
+    if grid.shape[0] == 1:
+        return grid.expand(latent_t, latent_h, latent_w).contiguous()
+    # Fit to the output length the way the source video is fitted, so the edit boundary does not drift.
+    if grid.shape[0] < num_frames:
+        grid = torch.cat([grid, grid[-1:].expand(num_frames - grid.shape[0], *grid.shape[1:])], dim=0)
+    return _temporal_group_max_pool(grid[:num_frames], latent_t=latent_t)
+
+
+def _temporal_group_max_pool(mask: torch.Tensor, *, latent_t: int) -> torch.Tensor:
+    """Max-pool frames onto the latents the causal video VAE encodes them into."""
+    clip = 17
+    frame_count = mask.shape[0]
+    num_chunks = -(-frame_count // clip)
+    padded = num_chunks * clip
+    if frame_count < padded:
+        mask = torch.cat([mask, mask[-1:].expand(padded - frame_count, *mask.shape[1:])], dim=0)
+    tokens: list[torch.Tensor] = []
+    for c in range(num_chunks):
+        chunk = mask[c * clip : (c + 1) * clip]
+        # Per 17-frame clip, token 0 covers frame 0 and token k covers frames 4k-3..4k; the VAE drops the last 3.
+        tokens.append(chunk[0:1].amax(dim=0))
+        for k in range(1, 5):
+            tokens.append(chunk[4 * k - 3 : 4 * k + 1].amax(dim=0))
+    result = torch.stack(tokens)[:-3]
+    if result.shape[0] != latent_t:
+        raise OmniClientError(
+            f"MiniMax H3 video_noise_mask temporal depth {frame_count} does not map to {latent_t} latents"
+        )
+    return result
 
 
 def _canonical_audio_edit_mask(value: Any, *, audio_t: int) -> torch.Tensor:
@@ -476,6 +532,7 @@ def prepare_encoder_inputs(
             latent_t=latent_t,
             latent_h=height // 16,
             latent_w=width // 16,
+            num_frames=num_frames,
         )
         if raw_video_edit_mask is not None
         else None
@@ -529,31 +586,11 @@ def prepare_encoder_inputs(
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
                     )
-                for item in prepared_videos:
-                    full_frames = load_video_frames(item["prepared_path"])
-                    encoded_video_inputs.append(_frames_to_tensor(full_frames))
-                    sampled = sample_reference_video_frames(
-                        item["prepared_path"],
-                        decoded_frames=full_frames,
-                    )
-                    video_timestamps.append(sampled["block_timestamps"])
-                    frames = np.stack(sampled["frames"])
-                    frame_count = int(frames.shape[0])
-                    qwen_video_inputs.append(
-                        (
-                            frames,
-                            {
-                                "total_num_frames": frame_count,
-                                "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                "video_backend": "minimax_h3",
-                                "frames_indices": list(range(frame_count)),
-                                "do_sample_frames": False,
-                            },
-                        )
-                    )
-                    if item["input_has_audio"]:
-                        waveform, sample_rate = load_video_audio(
+                audio_pool = ThreadPoolExecutor(max_workers=1)
+                try:
+                    audio_futures = [
+                        audio_pool.submit(
+                            load_video_audio,
                             item["original_path"],
                             start_time_seconds=float(item.get("start_time_seconds", 0.0)),
                             duration_seconds=item.get(
@@ -561,9 +598,40 @@ def prepare_encoder_inputs(
                                 item.get("duration_seconds"),
                             ),
                         )
-                        video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
-                    else:
-                        video_audio_inputs.append(None)
+                        if item["input_has_audio"]
+                        else None
+                        for item in prepared_videos
+                    ]
+                    for item, audio_future in zip(prepared_videos, audio_futures):
+                        full_frames = load_video_frames(item["prepared_path"])
+                        encoded_video_inputs.append(_frames_to_tensor(full_frames))
+                        sampled = sample_reference_video_frames(
+                            item["prepared_path"],
+                            decoded_frames=full_frames,
+                        )
+                        video_timestamps.append(sampled["block_timestamps"])
+                        frames = np.stack(sampled["frames"])
+                        frame_count = int(frames.shape[0])
+                        qwen_video_inputs.append(
+                            (
+                                frames,
+                                {
+                                    "total_num_frames": frame_count,
+                                    "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                    "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                    "video_backend": "minimax_h3",
+                                    "frames_indices": list(range(frame_count)),
+                                    "do_sample_frames": False,
+                                },
+                            )
+                        )
+                        if audio_future is not None:
+                            waveform, sample_rate = audio_future.result()
+                            video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
+                        else:
+                            video_audio_inputs.append(None)
+                finally:
+                    audio_pool.shutdown(wait=True, cancel_futures=True)
         audio_index = 0
         for video_index, item in enumerate(prepared_videos, start=1):
             if item["input_has_audio"]:
