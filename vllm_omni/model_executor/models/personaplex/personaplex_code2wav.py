@@ -107,7 +107,6 @@ class PersonaPlexCode2Wav(nn.Module):
         self.mimi: nn.Module | None = None
         self._additional_mimi = nn.ModuleList()
         self._mimi_device: torch.device | None = None
-        self._request_codes: dict[str, torch.Tensor] = {}
         self._request_codec_slots: dict[str, int] = {}
         self._consumed_full_payload_requests: set[str] = set()
 
@@ -177,10 +176,7 @@ class PersonaPlexCode2Wav(nn.Module):
         ``input_ids`` per request is ``[k * F]`` (codebook-major), where ``k``
         is ``self._num_codebooks``. Async inputs contain newly generated delta
         frames. Sync connector payloads contain the full sequence and may
-        persist across forwards, so they are consumed once per request. A
-        cumulative-prefix payload is also accepted: request-local code history
-        identifies the new suffix, which the streaming decoder consumes
-        exactly once.
+        persist across forwards, so they are consumed once per request.
         """
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
@@ -236,15 +232,12 @@ class PersonaPlexCode2Wav(nn.Module):
                 if state_id in self._consumed_full_payload_requests:
                     continue
                 self._consumed_full_payload_requests.add(state_id)
-            delta_kf = self._new_code_suffix(state_id, codes_kf)
-            if delta_kf.shape[1] == 0:
-                continue
             decode_t0 = frame_timing_clock()
-            wav = self._decode_streaming_frames(state_id, delta_kf.to(device=device))
+            wav = self._decode_streaming_frames(state_id, codes_kf.to(device=device))
             # Close the span with a host sync so decode_ms covers GPU
             # execution; serializes stage-1 decode while timing is on.
             frame_timing_synchronize()
-            log_stage1_decode_event(state_id, int(delta_kf.shape[1]), decode_t0, num_req)
+            log_stage1_decode_event(state_id, int(codes_kf.shape[1]), decode_t0, num_req)
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
 
@@ -280,24 +273,6 @@ class PersonaPlexCode2Wav(nn.Module):
                         request_id = meta.get("request_id")
             resolved.append(str(request_id) if request_id is not None else None)
         return resolved
-
-    def _new_code_suffix(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
-        if request_id is None:
-            return codes_kf
-
-        incoming = codes_kf.detach().to(device="cpu", dtype=torch.long)
-        previous = self._request_codes.get(request_id)
-        if (
-            previous is not None
-            and incoming.shape[1] >= previous.shape[1]
-            and torch.equal(incoming[:, : previous.shape[1]], previous)
-        ):
-            delta = incoming[:, previous.shape[1] :]
-            self._request_codes[request_id] = incoming
-            return delta
-
-        self._request_codes[request_id] = incoming if previous is None else torch.cat([previous, incoming], dim=1)
-        return incoming
 
     def _decode_streaming_frames(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
         codec, ephemeral = self._codec_for_request(request_id)
@@ -356,7 +331,6 @@ class PersonaPlexCode2Wav(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
             state_id = str(request_id)
-            self._request_codes.pop(state_id, None)
             self._consumed_full_payload_requests.discard(state_id)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()
