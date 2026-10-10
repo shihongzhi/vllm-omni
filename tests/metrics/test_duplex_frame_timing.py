@@ -250,6 +250,49 @@ def test_stamp_chunk_put_stamps_meta_only_when_enabled(
     assert before_ns <= meta.put_t_ns <= time.monotonic_ns()
 
 
+def test_put_t_ns_msgpack_round_trip_is_mixed_version_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct
+    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
+    def _over_the_connector_wire(meta: MetaStruct) -> tuple[bytes, dict[str, object]]:
+        wire = OmniSerializer.serialize(OmniPayloadStruct(meta=meta))
+        # The connector receive path decodes to plain dicts and reads the
+        # stamp with ``meta.get("put_t_ns")`` (chunk_transfer_adapter), so
+        # the dict — not the struct — is the wire contract.
+        return wire, OmniSerializer.deserialize(wire)
+
+    # Producer with the flag on: the stamp crosses the connector codec
+    # unchanged, so the other process measures the same put instant.
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", True)
+    stamped = MetaStruct(chunk_seq=7)
+    stamp_chunk_put(stamped)
+    wire_on, decoded_on = _over_the_connector_wire(stamped)
+    assert b"put_t_ns" in wire_on
+    stamped_meta = decoded_on.get("meta")
+    assert isinstance(stamped_meta, dict)
+    # Exact receiver-side read: a plain int the get path feeds into
+    # chunk_age_ms.
+    put_t_ns = stamped_meta.get("put_t_ns")
+    assert isinstance(put_t_ns, int) and not isinstance(put_t_ns, bool)
+    assert put_t_ns == stamped.put_t_ns
+    # An old-version consumer of the same chunk: the one extra key is inert
+    # next to the keys it already knows.
+    assert stamped_meta.get("chunk_seq") == 7
+
+    # Producer with the flag off: omit_defaults keeps the stamp off the wire
+    # entirely, so old consumers see no new field at any level.
+    monkeypatch.setattr(duplex_frame_timing, "_DUPLEX_FRAME_TIMING_ENABLED", False)
+    unstamped = MetaStruct(chunk_seq=8)
+    stamp_chunk_put(unstamped)
+    wire_off, decoded_off = _over_the_connector_wire(unstamped)
+    assert b"put_t_ns" not in wire_off
+    # Old producer, new consumer: the field is absent rather than zero, so
+    # the receiver reports chunk_age_ms=na instead of a bogus age.
+    assert decoded_off.get("meta", {}).get("put_t_ns") is None
+
+
 def test_append_event_reports_tick_period_with_default_fallback(
     monkeypatch: pytest.MonkeyPatch,
     timing_enabled: None,
