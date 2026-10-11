@@ -287,7 +287,7 @@ class ErnieImagePipeline(
         # model_index.json, so fall back to the checkpoint name until they do.
         # Cached snapshot paths end in a commit hash, so resolve them back to
         # the repo name first.
-        return "turbo" in repo_name_from_path(model).lower()
+        return "ernie-image-turbo" in repo_name_from_path(model).lower()
 
     def encode_prompt(
         self,

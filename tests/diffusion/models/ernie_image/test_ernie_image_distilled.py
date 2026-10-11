@@ -17,6 +17,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("/data/models/ernie-image-turbo", True),
         ("/data/models/ernie-image-turbo/", True),
         ("/data/models/ernie-image-base", False),
+        ("/data/models/ernie-image-not-turbo", False),
+        ("/data/models/ernie-image-on-turbo-node", False),
+        ("turbo-org/ERNIE-Image", False),
+        (
+            "/root/.cache/huggingface/hub/models--turbo-org--ERNIE-Image/snapshots/deadbeefdeadbeef",
+            False,
+        ),
         (
             "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image-Turbo/snapshots/deadbeefdeadbeef",
             True,
