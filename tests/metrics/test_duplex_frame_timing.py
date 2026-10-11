@@ -338,11 +338,12 @@ def test_audio_emit_event_derives_frames_from_duration(
     monkeypatch.setattr(duplex_frame_timing, "_tick_pacers", OrderedDict())
 
     with _capture_module_logs(caplog):
-        log_audio_emit_event("s1", 1, "req-1", {"audio_duration_ms": 240}, 80, sent_ms=160)
+        log_audio_emit_event("s1", 1, "req-1", {"audio_duration_ms": 240}, 80, sent_ms=160, response_id="resp-1")
 
     (line,) = _lines(caplog)
     assert line.startswith("DUPLEX_FRAME_TIMING event=audio_emit t_ns=")
     assert "request_id=req-1" in line
+    assert "response_id=resp-1" in line
     assert "frames=3" in line
     assert "audio_duration_ms=240.000" in line
     # Pre-emit playback watermark: with the stream's first emitted t_ns the
@@ -377,6 +378,95 @@ def test_audio_emit_event_skips_non_cadence_results(
         log_audio_emit_event("s1", 1, "req-1", audio_result, 80)
 
     assert _lines(caplog) == []
+
+
+def test_audio_emit_site_attributes_overlap_chunk_to_draining_response(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A late chunk of a draining response must be timed against that
+    response's own playback watermark, not the newer active response's zero
+    cursor, and output the channel rejects must stay out of the stream."""
+    import asyncio
+
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    monkeypatch.setattr(duplex_frame_timing, "_tick_pacers", OrderedDict())
+
+    session = DuplexEngineSession(
+        session_id="s-overlap-emit",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"], extra_body={"auto_response": True}),
+        capabilities=DuplexCapabilities(supports_concurrent_turn_requests=True, supports_core_resumable_request=False),
+    )
+    session.begin_response(turn_id=1)
+    r1 = session.active_response_id
+    assert r1 is not None
+    session.mark_audio_sent(160)
+    r1_request = "duplex-s.x.e.0.r.stage3-turn1"
+    session.bind_draining_request(r1_request, r1)
+    session.begin_response(turn_id=2)
+    session.bind_request("duplex-s.x.e.0.r.stage1-turn2")
+    # r1 keeps its watermark while the active response restarts at zero —
+    # the overlap state the pre-rework site misread via session.playback.
+    assert session.playback_for_response(r1).sent_ms == 160
+    assert session.playback.sent_ms == 0
+
+    class _Plane:
+        def is_terminal(self, request_id: str | None) -> bool:
+            del request_id
+            return False
+
+    class _Out:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def auto_responds(self) -> bool:
+            return True
+
+        def emit(self, payload: dict[str, object]) -> None:
+            self.events.append(payload)
+
+    out = _Out()
+
+    async def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    channel = ModelChannel(
+        SimpleNamespace(
+            session=session,
+            plugin=SimpleNamespace(data_plane=_Plane()),
+            run=SimpleNamespace(closing=False),
+        ),
+        out,
+        close_from_runtime=_noop,
+        schedule_silence_continuation=_noop,
+        abort_request=_noop,
+    )
+
+    def _delta(request_id: str) -> dict[str, object]:
+        return {
+            "data_plane_request_id": request_id,
+            "audio": "b64",
+            "audio_duration_ms": 240,
+            "end_of_turn": False,
+        }
+
+    with _capture_module_logs(caplog):
+        asyncio.run(channel._send_one_model_output_event(_delta(r1_request)))
+        # Unknown request: rejected at the acceptance gate, so it must not
+        # reach the cadence stream either.
+        asyncio.run(channel._send_one_model_output_event(_delta("duplex-s.x.e.0.r.unknown")))
+
+    (line,) = [message for message in _lines(caplog) if "event=audio_emit" in message]
+    assert line.startswith("DUPLEX_FRAME_TIMING event=audio_emit t_ns=")
+    assert f"request_id={r1_request}" in line
+    assert f"response_id={r1}" in line
+    # The owning response's pre-emit watermark, read before mark_audio_sent
+    # advanced it; the old site would have logged the active cursor's 0.
+    assert "sent_ms=160" in line
 
 
 def test_connector_get_event_reports_chunk_age_from_put_stamp(

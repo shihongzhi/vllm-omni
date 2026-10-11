@@ -621,17 +621,6 @@ class ModelChannel:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context()
         for model_result in self._ctx.plugin.data_plane.project(result, context=context):
-            log_audio_emit_event(
-                session.session_id,
-                session.epoch,
-                request_id,
-                model_result,
-                session.capabilities.chunk_period_ms,
-                # Read before _send_one_model_output_event advances the
-                # watermark, so the line carries the pre-emit underrun
-                # exposure of this stream.
-                session.playback.sent_ms,
-            )
             close_reason_for_result, did_emit = await self._send_one_model_output_event(
                 model_result,
                 expected_epoch=expected_epoch,
@@ -1078,6 +1067,20 @@ class ModelChannel:
             response_request_metrics=response_request_metrics,
         )
         self._out.emit(payload)
+        # Timing hook, placed after acceptance and response resolution: the
+        # line must attribute to the response that owns this chunk (the
+        # draining one during overlap, never the newer active response) and
+        # carry that response's pre-emit watermark — previous_sent_ms, read
+        # above before mark_audio_sent advanced it.
+        log_audio_emit_event(
+            session.session_id,
+            session.epoch,
+            data_plane_request_id if isinstance(data_plane_request_id, str) else None,
+            model_result,
+            session.capabilities.chunk_period_ms,
+            previous_sent_ms,
+            response_id=response_id,
+        )
         if self._ctx.run.closing:
             return close_reason, emitted_response
         if (

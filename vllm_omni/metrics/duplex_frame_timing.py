@@ -39,12 +39,16 @@ engine-resident session owner with the #7413 rework).
   forward while the flag is on; ``num_req`` reports that forward's batch
   size (RFC #7389 item 8) so decode cost is only compared to the tick budget
   at a known batch level.
-- ``audio_emit`` (model channel, engine): an audio delta was projected for
-  the client. Reports emit ``jitter_ms`` and output ``drift_ms`` against
-  the tick budget — the server-side counterpart of the client receive
-  timeline — plus ``sent_ms``, the response's playback watermark before
-  this emit; the underrun margin follows offline as ``sent_ms`` minus the
-  wall time since the stream's first emitted ``t_ns``.
+- ``audio_emit`` (model channel, engine): an audio delta was accepted and
+  projected for the client, logged after the delta's response is resolved
+  so ``request_id``/``response_id`` attribute the line to the response
+  that owns the chunk (the draining one during overlap, never the newer
+  active response) and rejected output stays out of the cadence stream.
+  Reports emit ``jitter_ms`` and output ``drift_ms`` against the tick
+  budget — the server-side counterpart of the client receive timeline —
+  plus ``sent_ms``, that response's playback watermark before this emit;
+  the underrun margin follows offline as ``sent_ms`` minus the wall time
+  since the stream's first emitted ``t_ns``.
 
 Name and clock alignment with #7242 / #7025:
 
@@ -276,13 +280,19 @@ def log_audio_emit_event(
     audio_result: Any,
     tick_period_ms: float | None,
     sent_ms: int | None = None,
+    response_id: str | None = None,
 ) -> None:
-    """Site hook (runtime bridge): an audio delta was projected for the
-    client. ``audio_result`` is the projected native event; non-dict results
-    and events without a positive ``audio_duration_ms`` are not cadence
-    points. ``sent_ms`` is the response's ``playback.sent_ms`` watermark
-    before this emit, so the feed-starvation (underrun) margin is derivable
-    offline against the stream's first emitted ``t_ns``."""
+    """Site hook (model channel): an audio delta was accepted and projected
+    for the client — called after the delta's response is resolved, so
+    ``request_id``/``response_id`` attribute the line to the response that
+    owns the chunk (the draining one during overlap), never to a response
+    the chunk does not belong to, and rejected output never reaches the
+    cadence stream. ``audio_result`` is the projected native event;
+    non-dict results and events without a positive ``audio_duration_ms``
+    are not cadence points. ``sent_ms`` is that response's
+    ``playback.sent_ms`` watermark before this emit, so the
+    feed-starvation (underrun) margin is derivable offline against the
+    stream's first emitted ``t_ns``."""
     if not duplex_frame_timing_enabled() or not isinstance(audio_result, dict):
         return
     duration_ms = audio_result.get("audio_duration_ms")
@@ -296,6 +306,7 @@ def log_audio_emit_event(
         session=session_id,
         epoch=epoch,
         request_id=request_id,
+        response_id=response_id,
         frames=frames,
         # Coerced so the field renders like every other duration regardless
         # of the int/float the projected event carried.
