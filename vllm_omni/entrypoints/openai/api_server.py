@@ -192,6 +192,7 @@ from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
+    _cleanup_timeline_guides,
     _cleanup_video,
     _cleanup_video_references,
     _parse_video_form,
@@ -2692,6 +2693,7 @@ async def create_video(
 
     def _cleanup_request_resources() -> None:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
@@ -2804,6 +2806,7 @@ async def create_video_sync(
         ) from exc
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
