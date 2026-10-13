@@ -271,9 +271,11 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
     engine._init_runtime_state()
     engine._init_execute_fn()
     engine.stop_event = threading.Event()
-    outputs: queue.Queue[tuple[str, DiffusionOutput]] = queue.Queue()
-    engine._put_output = lambda request_id, output: outputs.put((request_id, output))
+    outputs: queue.Queue[DiffusionOutput] = queue.Queue()
     request = _new_output("abort-last").scheduled_new_reqs[0].req
+    # Terminal outputs ride the request's own stream, captured before
+    # finalization so a reused id cannot misroute them.
+    engine._out_streams[request.request_id] = outputs
     engine.scheduler.add_request(request)
     thread = threading.Thread(target=engine._busy_loop)
     thread.start()
@@ -287,8 +289,7 @@ def test_public_abort_releases_step_state_after_the_wave_without_another_request
         if phase == "denoise":
             assert runner.input_batch is not None
         resume.set()
-        request_id, output = outputs.get(timeout=10)
-        assert request_id == request.request_id
+        output = outputs.get(timeout=10)
         assert output.aborted
         assert not engine.scheduler.has_requests()
         assert runner.state_cache == {}

@@ -201,6 +201,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        #: Monotonic latch: a denoise ``InputBatch`` has been built at least
+        #: once. Completion releases can clear ``input_batch`` afterwards, so
+        #: memory profiling reads this instead of the live attribute.
+        self._denoise_batch_built = False
         self._interaction_coordinator: InteractionCoordinator | None = None
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
@@ -1053,10 +1057,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         record_output_peak_memory=False,
                         in_diffusion_kv_memory_profile=True,
                     )
-                # An emptied state_cache means the profile request finished
-                # inside its prepare phase and never sized a denoise batch,
-                # which is as useless for this profile as running out of waves.
-                if self.input_batch is None:
+                # Completed requests release the batch they lived in, so the
+                # verdict reads the build latch instead of ``input_batch``. An
+                # emptied state_cache without one means the profile request
+                # finished inside its prepare phase and never sized a denoise
+                # batch, which is as useless for this profile as running out
+                # of waves.
+                if not getattr(self, "_denoise_batch_built", False):
                     raise RuntimeError(
                         "Diffusion memory profiling did not reach a denoise step after "
                         f"{waves} prepare waves; the profile would understate the budget."
@@ -1285,6 +1292,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             cached_batch=getattr(self, "input_batch", None),
         )
         self.input_batch = input_batch
+        self._denoise_batch_built = True
         return prepared_states, input_batch, pending_outputs
 
     def _fail_stepwise_request(
@@ -1415,9 +1423,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
-        for state in states:
-            if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
+        # Include per-request errors, whose cache entries were already removed.
+        self.release_step_requests(
+            [
+                state.request_id
+                for state in states
+                if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+            ]
+        )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
