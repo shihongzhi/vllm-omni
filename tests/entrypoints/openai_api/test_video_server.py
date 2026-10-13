@@ -2702,6 +2702,99 @@ def test_delete_aborts_engine_request_before_cancelling_task(test_client):
     assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
 
+def test_create_video_rolls_back_job_when_task_registration_fails(test_client, monkeypatch):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    cleanups = []
+    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+
+    async def failing_upsert(video_id, task):
+        del video_id, task
+        raise RuntimeError("task registry unavailable")
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", failing_upsert)
+
+    with pytest.raises(RuntimeError, match="task registry unavailable"):
+        test_client.post("/v1/videos", data={"prompt": "Roll back this video"})
+
+    assert cleanups
+    assert not handler.started.is_set()
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+def test_create_video_cleans_references_when_task_cancelled_before_start(test_client, monkeypatch):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    cleanups = []
+    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    async def cancelling_upsert(video_id, task):
+        # The job coroutine never starts, so its own finally block cannot clean up.
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", cancelling_upsert)
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Cancel before start"})
+    assert create_resp.status_code == 200
+    _wait_until(lambda: len(cleanups) == 1)
+    assert not handler.started.is_set()
+
+
+def test_delete_failed_job_removes_unpublished_partial_artifact(test_client):
+    job = VideoResponse(model="test-model", prompt="Fail after partial save", status=VideoGenerationStatus.FAILED)
+    assert job.file_name is None
+    asyncio.run(api_server.VIDEO_STORE.upsert(job.id, job))
+    file_path = api_server.STORAGE_MANAGER.get_full_file_path(job.id)
+    Path(file_path).write_bytes(b"partial-video")
+
+    delete_resp = test_client.delete(f"/v1/videos/{job.id}")
+
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+    assert not os.path.exists(file_path)
+    assert asyncio.run(api_server.VIDEO_STORE.get(job.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delete_does_not_interrupt_job_cancellation_cleanup():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def job() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleaned.set()
+            raise
+
+    ref = VideoResponse(model="test-model", prompt="Slow cleanup", status=VideoGenerationStatus.IN_PROGRESS)
+    await api_server.VIDEO_STORE.upsert(ref.id, ref)
+    task = asyncio.create_task(job())
+    await asyncio.sleep(0)
+    await api_server.VIDEO_TASKS.upsert(ref.id, task)
+    raw_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(openai_serving_video=BlockingVideoHandler()))
+    )
+
+    delete = asyncio.create_task(api_server.delete_video(ref.id, raw_request))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2.0)
+    # A client disconnect cancels DELETE; the job's own cleanup must still finish.
+    delete.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delete
+    assert not task.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned.is_set()
+
+
 def test_video_response_file_extension_is_robust():
     response = VideoResponse(model="test-model", prompt="Make something beautiful")
     assert response.file_extension == "mp4"
