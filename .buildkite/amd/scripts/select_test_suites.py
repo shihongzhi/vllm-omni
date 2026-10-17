@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Select AMD L2/L3 suites after Buildkite has created an AMD build.
+"""Select AMD ready/merge/nightly/weekly suites after Buildkite creates a build.
 
 This repository-side selector does not decide which GitHub label events start
 the external ``vllm-omni-amd-ci`` pipeline. Its Buildkite PR build condition
@@ -17,6 +17,8 @@ from collections.abc import Iterable
 SUITE_SPECS = {
     "ready": "READY_TESTS:test-amd-ready.yml",
     "merge": "MERGE_TESTS:test-amd-merge.yml",
+    "nightly": "NIGHTLY_TESTS:test-amd-nightly.yml",
+    "weekly": "WEEKLY_TESTS:test-amd-weekly.yml",
 }
 
 
@@ -28,7 +30,7 @@ def _parse_debug_suites(value: str) -> tuple[str, ...]:
     seen: set[str] = set()
     for suite in suites:
         if suite not in SUITE_SPECS:
-            raise ValueError(f"DEBUG_TEST_YAML entries must be 'merge' or 'ready', got {suite!r}")
+            raise ValueError(f"DEBUG_TEST_YAML entries must be 'merge', 'nightly', 'ready', or 'weekly', got {suite!r}")
         if suite in seen:
             raise ValueError(f"duplicate DEBUG_TEST_YAML suite {suite!r}")
         seen.add(suite)
@@ -40,18 +42,35 @@ def select_amd_test_suites(
     branch: str,
     labels: Iterable[str],
     debug_test_yaml: str = "",
+    nightly: bool = False,
+    weekly: bool = False,
 ) -> tuple[str, ...]:
     """Return ordered suite names while preserving legacy unlabeled PRs."""
 
     if debug_test_yaml:
         return _parse_debug_suites(debug_test_yaml)
     if branch == "main":
+        if nightly and weekly:
+            raise ValueError("scheduled main builds select nightly or weekly, not both")
+        if nightly:
+            return ("nightly",)
+        if weekly:
+            return ("weekly",)
         return ("merge",)
 
     label_set = {label.strip() for label in labels if label.strip()}
-    selected = tuple(suite for label, suite in (("ready", "ready"), ("merge-test", "merge")) if label in label_set)
-    # AMD historically uploaded L2 for every PR build. Keep that behavior for
-    # triggers such as amd-test while adding tier selection for ready/merge-test.
+    selected = tuple(
+        suite
+        for label, suite in (
+            ("ready", "ready"),
+            ("merge-test", "merge"),
+            ("nightly-test", "nightly"),
+            ("weekly-test", "weekly"),
+        )
+        if label in label_set
+    )
+    # AMD historically uploaded the ready suite for every admitted PR build.
+    # Preserve that fallback when no explicit tier label is present.
     return selected or ("ready",)
 
 
@@ -60,6 +79,8 @@ def main() -> int:
     parser.add_argument("--branch", required=True)
     parser.add_argument("--labels", default="")
     parser.add_argument("--debug-test-yaml", default="")
+    parser.add_argument("--nightly", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--weekly", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
 
     labels = tuple(args.labels.splitlines())
@@ -68,19 +89,17 @@ def main() -> int:
             branch=args.branch,
             labels=labels,
             debug_test_yaml=args.debug_test_yaml,
+            nightly=bool(args.nightly),
+            weekly=bool(args.weekly),
         )
     except ValueError as exc:
         parser.error(str(exc))
 
     label_set = {label.strip() for label in labels if label.strip()}
-    if not args.debug_test_yaml and args.branch != "main" and not ({"ready", "merge-test"} & label_set):
+    tier_labels = {"ready", "merge-test", "nightly-test", "weekly-test"}
+    if args.branch != "main" and not args.debug_test_yaml and not (tier_labels & label_set):
         print(
-            "No AMD L2/L3 tier label found; preserving the legacy ready-suite fallback.",
-            file=sys.stderr,
-        )
-    if "nightly-test" in label_set:
-        print(
-            "AMD nightly-test has no suite yet and does not affect L2/L3 selection.",
+            "No AMD ready/merge/nightly/weekly label found; preserving the legacy ready-suite fallback.",
             file=sys.stderr,
         )
 

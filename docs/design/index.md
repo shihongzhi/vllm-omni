@@ -36,6 +36,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Mooncake Store Connector](feature/omni_connectors/mooncake_store_connector.md)
 - [Mooncake Transfer Engine Connector](feature/omni_connectors/mooncake_transfer_engine_connector.md)
 - [Mori Transfer Engine Connector](feature/omni_connectors/mori_transfer_engine_connector.md)
+- [NIXL Connector](feature/omni_connectors/nixl_connector.md)
 - [Shared Memory Connector](feature/omni_connectors/shared_memory_connector.md)
 - [Yuanrong Store Connector](feature/omni_connectors/yuanrong_connector.md)
 - [Yuanrong Transfer Engine Connector](feature/omni_connectors/yuanrong_transfer_engine_connector.md)
@@ -56,6 +57,10 @@ implementation contract; it is not, by itself, a general support claim.
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
 
+#### KV cache and memory management
+
+- [Scheduler-Managed Paged KV Cache for Diffusion DiT Stages](feature/diffusion_paged_kv_cache.md)
+
 #### Attention optimization
 
 The [Diffusion Attention Backends](../user_guide/diffusion/attention_backends.md)
@@ -63,6 +68,7 @@ guides list selectable backends, platform defaults, installation, and tuning.
 The design contracts separate selection mechanics from backend algorithms:
 
 - [Attention Backend Selection](feature/attention_backend_selection.md)
+- [Attention Execution Contract PoC](feature/attention_execution_contract_poc.md)
 - [Skip-Softmax](feature/skip_softmax.md)
 
 #### CPU offloading
@@ -110,3 +116,6 @@ The design contracts separate selection mechanics from backend algorithms:
 The pre-#5137 pages are preserved in the
 [legacy module archive](module/archive/README.md) for historical reference and
 are not active design contracts.
+
+- [Qwen3-Omni MRv2 performance](qwen3_omni_mrv2_performance.md)
+- [MiniCPM-o 4.5 turn-mode MRv2 performance](minicpm_o45_mrv2_performance.md)

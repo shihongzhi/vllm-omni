@@ -82,6 +82,11 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     return path
 
 
+def write_json_artifact(path: Path, value: Any) -> None:
+    """Write a UTF-8 accuracy artifact, rejecting non-finite JSON numbers."""
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
 DEFAULT_DEVICE_PROFILE = "default"
 
 
@@ -133,6 +138,32 @@ def resolve_similarity_thresholds(
         raise ValueError("threshold table must include a 'default' entry")
     profile = device_profile or resolve_device_profile(device_name, profiles=table)
     return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
+
+
+def resolve_device_threshold(
+    thresholds: float | int | Mapping[str, float],
+    *,
+    device_name: str | None = None,
+    label: str = "threshold",
+) -> tuple[str, float]:
+    """Resolve a scalar or per-GPU threshold for the current CUDA device.
+
+    Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
+    A mapping matches keys as substrings of the device name via
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
+    Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
+    otherwise unmatched devices raise.
+    """
+    if isinstance(thresholds, float | int):
+        return DEFAULT_DEVICE_PROFILE, float(thresholds)
+
+    profile = resolve_device_profile(device_name, profiles=thresholds)
+    if profile in thresholds:
+        return profile, float(thresholds[profile])
+    if DEFAULT_DEVICE_PROFILE in thresholds:
+        return DEFAULT_DEVICE_PROFILE, float(thresholds[DEFAULT_DEVICE_PROFILE])
+    known = ", ".join(str(key) for key in thresholds)
+    raise RuntimeError(f"no {label} entry for device profile {profile!r}; known: {known}")
 
 
 _SSIM_RE = re.compile(r"All:(?P<score>[0-9.]+)")
@@ -432,6 +463,24 @@ def assert_similarity(
         reference=diffusers_image,
         compare_mode=compare_mode,
     )
+    assert_similarity_metrics(
+        model_name=model_name,
+        ssim_score=ssim_score,
+        psnr_score=psnr_score,
+        ssim_threshold=ssim_threshold,
+        psnr_threshold=psnr_threshold,
+    )
+
+
+def assert_similarity_metrics(
+    *,
+    model_name: str,
+    ssim_score: float,
+    psnr_score: float,
+    ssim_threshold: float,
+    psnr_threshold: float,
+) -> None:
+    """Check computed image metrics, allowing callers to save all evidence first."""
     print(f"{model_name} similarity metrics:")
     print(f"  SSIM: value={ssim_score:.6f}, threshold>={ssim_threshold:.6f}, range=[-1, 1], higher_is_better=True")
     print(
