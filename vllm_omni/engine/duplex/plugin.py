@@ -32,6 +32,8 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
@@ -303,6 +305,22 @@ class DuplexModelPlugin(ABC):
         # Constructor-only: concrete plugins hand the encoder to their data plane.
         del encode_audio
 
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        """Bind model policy to the resolved deployment topology before admission."""
+
+    def input_stage_id(self, payload: object) -> int:
+        """Select the entry stage for one append before reserving its request."""
+        return 0
+
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        """Separate the next ASR-only input from a batched response input.
+
+        The remaining committed payload resumes after this item's transcript
+        has reached conversation history. Models without an ASR entry stage
+        consume their input normally.
+        """
+        return payload, None
+
     def silence_unit_payload(self) -> dict[str, object]:
         """One silence unit as an append payload (``pcm_f32le`` zeros).
 
@@ -336,6 +354,9 @@ class DuplexModelPlugin(ABC):
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Commit model-owned context after the stage accepts a fenced append."""
 
     @abstractmethod
     def plan_append(
@@ -566,6 +587,25 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
             )
 
 
+def validate_duplex_replica_policy(
+    plugin: DuplexModelPlugin,
+    runtime_config: DuplexSessionRuntimeConfig,
+    *,
+    distributed: bool,
+) -> None:
+    """Validate replica policy before workers start and against the actual stage pools."""
+    if runtime_config.replica_policy == "legacy":
+        return
+    if distributed:
+        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
+    cap = runtime_config.max_sessions_per_replica
+    assert cap is not None
+    # This capability depends on the requested capacity for some plugins; the
+    # global admission limit does not describe sharing within a single replica.
+    if cap > 1 and not plugin.capabilities(max_sessions=cap).supports_multi_session_same_replica:
+        raise ValueError("This duplex plugin does not support sharing a replica; set max_sessions_per_replica to 1")
+
+
 @lru_cache(maxsize=8)
 def _silence_pcm_f32le_base64(samples: int) -> str:
     return base64.b64encode(bytes(max(0, samples) * 4)).decode("ascii")
@@ -605,4 +645,5 @@ __all__ = [
     "payload_turn_id",
     "reject_changed_runtime_value",
     "validate_duplex_plugin_sampling",
+    "validate_duplex_replica_policy",
 ]
