@@ -616,13 +616,14 @@ def test_stage1_decode_site_reports_frame_count(
     )
 
     class _FakeStreamingMimi(nn.Module):
-        def streaming_init(self, batch_size: int) -> None:
+        def streaming_init(self, num_rows: int, *, encode: bool = True) -> None:
             pass
 
-        def decode_frame(self, codes: torch.Tensor) -> torch.Tensor:
-            return torch.zeros(codes.shape[-1] * 4, dtype=torch.float32)
+        def decode_frame(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+            # Shared-row decoder interface (#8441): codes [rows, k] -> PCM [rows, samples].
+            return torch.zeros(codes.shape[0], 4, dtype=torch.float32)
 
-        def reset_streaming(self) -> None:
+        def reset_slot(self, row: int) -> None:
             pass
 
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
@@ -643,6 +644,65 @@ def test_stage1_decode_site_reports_frame_count(
 
     with _capture_module_logs(caplog):
         model(input_ids=codes, request_ids=["req-1"])
+
+    (line,) = _lines(caplog)
+    assert line.startswith("DUPLEX_FRAME_TIMING event=stage1_decode t_ns=")
+    assert "request_id=req-1" in line
+    assert "frames=3" in line
+    assert "num_req=1" in line
+    assert "decode_ms=" in line
+    assert sync_calls == ["sync"]
+
+
+def test_stage1_decode_site_covers_the_async_spans_path(
+    monkeypatch: pytest.MonkeyPatch,
+    timing_enabled: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import torch
+    from torch import nn
+
+    import vllm_omni.platforms as platforms_module
+    from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import PersonaPlexCode2Wav
+
+    # Async-chunk steps decode through _decode_input_id_spans' shared batched
+    # pass, not the per-request fallback; the site must fire there too.
+    sync_calls: list[str] = []
+    monkeypatch.setattr(
+        platforms_module,
+        "current_omni_platform",
+        SimpleNamespace(synchronize=lambda: sync_calls.append("sync")),
+    )
+
+    class _FakeBatchedMimi(nn.Module):
+        def streaming_init(self, num_rows: int, *, encode: bool = True) -> None:
+            pass
+
+        def decode_frame(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(codes.shape[0], 4, dtype=torch.float32)
+
+        def reset_slot(self, row: int) -> None:
+            pass
+
+    mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="/unused",
+            hf_config=SimpleNamespace(mimi_config=mimi_config, mimi_name=None),
+            duplex_max_sessions=1,
+            async_chunk=True,
+        ),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    model = PersonaPlexCode2Wav(vllm_config=vllm_config)
+    model._install_mimi(_FakeBatchedMimi(), torch.device("cpu"))
+
+    # 2 codebooks x 3 frames, flattened codebook-major; the runner hands the
+    # step's token spans via seq_token_counts, taking the fast path.
+    codes = torch.arange(3, dtype=torch.long).repeat(2)
+
+    with _capture_module_logs(caplog):
+        model(input_ids=codes, request_ids=["req-1"], seq_token_counts=[codes.numel()])
 
     (line,) = _lines(caplog)
     assert line.startswith("DUPLEX_FRAME_TIMING event=stage1_decode t_ns=")

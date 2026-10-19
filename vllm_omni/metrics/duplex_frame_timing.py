@@ -32,11 +32,13 @@ engine-resident session owner with the #7413 rework).
   Both stamps are host-scoped ``time.monotonic_ns()``, so the age is valid
   across the producer and consumer processes; it reads ``na`` when the
   producing side ran with the flag off.
-- ``stage1_decode`` (PersonaPlex Code2Wav, stage-1 worker): streaming Mimi
-  decode time for the new frames of a request. The site closes the span with
-  ``frame_timing_synchronize()`` so ``decode_ms`` covers GPU execution, at
-  the documented cost of serializing stage-1 decode across the requests of a
-  forward while the flag is on; ``num_req`` reports that forward's batch
+- ``stage1_decode`` (PersonaPlex Code2Wav, stage-1 worker): decode time for
+  the new frames of a request. Every request of a step is decoded in one
+  shared-decoder batched pass (#8441), so the site takes one span per
+  forward and closes it with a single ``frame_timing_synchronize()`` so
+  ``decode_ms`` covers GPU execution, at the documented cost of serializing
+  stage-1 decode while the flag is on; each request of the pass logs that
+  span under its own ``frames``. ``num_req`` reports that forward's batch
   size (RFC #7389 item 8) so decode cost is only compared to the tick budget
   at a known batch level.
 - ``audio_emit`` (model channel, engine): an audio delta was accepted and
@@ -160,10 +162,10 @@ def frame_timing_synchronize() -> None:
     launch (stage-1 Mimi decode) with a host sync, so the logged wrap time
     includes GPU execution instead of just the launch.
 
-    Calling this per request serializes stage-1 decode — the documented cost
-    of real ``decode_ms`` numbers. A no-op while the flag is unset, and goes
-    through ``current_omni_platform`` rather than a direct accelerator sync
-    so it stays correct on every backend.
+    Calling this per decode span serializes stage-1 decode — the documented
+    cost of real ``decode_ms`` numbers. A no-op while the flag is unset, and
+    goes through ``current_omni_platform`` rather than a direct accelerator
+    sync so it stays correct on every backend.
     """
     if not duplex_frame_timing_enabled():
         return
@@ -372,11 +374,12 @@ def log_stage1_decode_event(
     started_at: float,
     num_req: int,
 ) -> None:
-    """Site hook (PersonaPlex Code2Wav): streaming Mimi decode of the new
-    frames of a request. ``started_at`` is the ``frame_timing_clock()`` stamp
-    taken before the decode and closed by ``frame_timing_synchronize()``, so
-    ``decode_ms`` covers GPU execution. ``num_req`` is the forward's batch
-    size the decode ran under (RFC #7389 item 8)."""
+    """Site hook (PersonaPlex Code2Wav): decode of the new frames of a
+    request, as part of the forward's shared batched decode pass. ``started_at``
+    is the ``frame_timing_clock()`` stamp taken before the pass and closed by
+    ``frame_timing_synchronize()``, so ``decode_ms`` covers GPU execution.
+    ``num_req`` is the forward's batch size the decode ran under
+    (RFC #7389 item 8)."""
     if not duplex_frame_timing_enabled():
         return
     log_frame_timing(
