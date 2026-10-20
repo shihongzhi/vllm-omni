@@ -360,9 +360,10 @@ class DecodeGraphRunner:
     A capture is invalidated when the cache reallocates (tracked by
     ``PagedDecodeCache.generation``), which happens once per bucket boundary.
     The lifecycle is therefore: captured lazily on the first step that needs a
-    (bucket, generation), replayed for every later one, orphaned by a realloc,
-    and all of it dropped by ``release_captured_graphs`` when sleep discards
-    the memory a capture recorded. ``READINESS_DECODE_WARM_BUCKET`` moves the
+    (bucket, generation), replayed for every later one, dropped when a realloc
+    moves the generation past it -- the key can no longer select it -- and the
+    survivors dropped by ``release_captured_graphs`` when sleep discards the
+    memory a capture recorded. ``READINESS_DECODE_WARM_BUCKET`` moves the
     captures a think request would have paid into startup: the pipeline
     pre-grows the cache and captures one graph per bucket there at readiness,
     so serving below that bucket replays and never reallocates.
@@ -376,6 +377,7 @@ class DecodeGraphRunner:
         self.indexes = torch.zeros(3, 1, dtype=torch.long, device=device)
         self._graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
         self.captures = 0
+        self._generation = cache.generation
 
     def _forward(self):
         return self.lm(
@@ -419,6 +421,14 @@ class DecodeGraphRunner:
         """Run one decode step. Returns the static logits tensor."""
         self.input_ids[0, 0] = token
         self.indexes[0, 0] = t_index
+        # A realloc orphans every older-generation entry -- the key below can
+        # never select it again -- so it is dropped here rather than held until
+        # ``release_captured_graphs``. The drop returns the graph exec and the
+        # static logits to the shared pool's free list for later captures,
+        # without touching the addresses any surviving graph baked.
+        if self.cache.generation != self._generation:
+            self._graphs = {key: entry for key, entry in self._graphs.items() if key[1] == self.cache.generation}
+            self._generation = self.cache.generation
         # The graph key is the bucket of the length being served -- the one
         # whose ``max_seqlen_k`` the capture baked -- not the buffer's own, so
         # a pre-grown cache replays the graph its sequence fits instead of the
