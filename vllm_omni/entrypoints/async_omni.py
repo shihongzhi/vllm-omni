@@ -14,10 +14,12 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 from vllm import TokensPrompt
+from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -33,7 +35,7 @@ from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
     from vllm.v1.engine.input_processor import InputProcessor
+    from vllm.v1.kv_hints import KvHintsEnvelope
 
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
@@ -107,6 +110,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._sleeping_tags: set[str] = set()
         self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
+        # Paced interaction ingress is stamped before ordered worker delivery.
+        self._interaction_reservations: dict[tuple[str, str], float | None] = {}
 
     # ==================== Generate Method ====================
 
@@ -125,9 +130,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        submitted: asyncio.Future[None] | None = None,
+        entry_stage_id: int = 0,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -154,6 +162,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            entry_stage_id: Stage the request is submitted to; > 0 bypasses
+                stage 0 and leaves the prompt raw for that stage. Streaming
+                prompts always enter at stage 0.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -257,6 +268,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
+            for index, params in enumerate(req_sp_list):
+                if isinstance(params, OmniDiffusionSamplingParams) and params.streaming_buffer_seconds is not None:
+                    self.validate_streaming_playback_request()
+                    req_sp_list[index] = replace(params, streaming_output_ack=True)
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
@@ -277,6 +292,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
                     first_chunk_submitted=first_chunk_submitted,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
                 await first_chunk_submitted
             else:
@@ -288,6 +304,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    entry_stage_id=entry_stage_id,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
@@ -296,6 +314,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             if admitting:
                 await self._release_generate_admission()
                 admitting = False
+            # Callers wait on this before abort so Stage0 observes the sender cache.
+            if submitted is not None and not submitted.done():
+                submitted.set_result(None)
             # Refresh gauges on arrival.
             self._publish_request_gauges(len(self.request_states))
 
@@ -311,6 +332,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 wall_start_ts,
             ):
                 yield output
+                metadata = (getattr(output, "multimodal_output", None) or {}).get("metadata", {})
+                stream = metadata.get("stream", {}) if isinstance(metadata, dict) else {}
+                chunk_index = stream.get("output_chunk_index") if isinstance(stream, dict) else None
+                if chunk_index is not None:
+                    await self._engine_core_rpc(
+                        "release_streaming_output", stage_ids=[0], args=(request_id, chunk_index)
+                    )
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
@@ -332,6 +360,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 input_stream_task.cancel()
             if admitting:
                 await self._release_generate_admission()
+            reservations = getattr(self, "_interaction_reservations", {})
+            for key in [key for key in reservations if key[0] == request_id]:
+                reservations.pop(key, None)
             self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
@@ -361,6 +392,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         arrival_time: float,
         lora_request: Any = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -422,6 +454,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
                                 resumable=True,
+                                **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
                         )
                         has_submitted_first_chunk = True
@@ -479,6 +512,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
                                     resumable=False,
+                                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
                             )
                             has_submitted_first_chunk = True
@@ -611,25 +645,22 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids, timeout=timeout)
 
-    async def submit_interaction_async(
-        self,
-        request_id: str,
-        *,
-        interaction: OmniInteractionPrompt,
-    ) -> None:
-        """Apply a midway interaction to an active streaming diffusion request.
+    async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
+        """Forward external-session playback progress to the diffusion engine."""
+        self.validate_streaming_playback_request()
+        for state in list(self.request_states.values()):
+            if state.external_request_id == request_id:
+                await self._engine_core_rpc(
+                    "update_streaming_playback", stage_ids=[0], args=(state.request_id, position_seconds)
+                )
 
-        ``request_id`` is the external id created by the server-side session,
-        matching the value passed to :meth:`generate`.
-        """
-        event = interaction.get("event")
-        prompt = event.get("prompt") if isinstance(event, dict) else None
-        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
-            raise ValueError("prompt must be non-empty")
-        transition_chunks = interaction.get("transition_chunks")
-        if transition_chunks is not None and transition_chunks < 0:
-            raise ValueError("transition_chunks must be >= 0")
+    def validate_streaming_playback_request(self) -> None:
+        """Validate pacing topology before a realtime video request starts."""
+        if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
+            raise ValueError("playback feedback requires single-stage diffusion")
 
+    def _resolve_interaction_request(self, request_id: str) -> str:
+        """Validate and map an external streaming id to its internal id."""
         if self.num_stages != 1:
             raise ValueError("interaction requires single-stage diffusion")
         stage_meta = self.engine.get_stage_metadata(0)
@@ -643,13 +674,97 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             raise ValueError(
                 f"interaction requires exactly one active request for {request_id!r}, found {len(internal_ids)}"
             )
+        return internal_ids[0]
 
-        await self.engine.submit_interaction_async(
-            internal_ids[0],
-            interaction=interaction,
-        )
+    def _interaction_reservations_map(self) -> dict[tuple[str, str], float | None]:
+        """Lazily provide state for lightweight objects that skip ``__init__``."""
+        reservations = getattr(self, "_interaction_reservations", None)
+        if reservations is None:
+            reservations = {}
+            self._interaction_reservations = reservations
+        return reservations
+
+    async def reserve_streaming_interaction(self, request_id: str, event_id: str) -> float | None:
+        """Reserve an engine-clock ingress timestamp without waiting for a worker RPC."""
+        internal_id = self._resolve_interaction_request(request_id)
+        reservations = self._interaction_reservations_map()
+        reservation_key = (internal_id, event_id)
+        reservations[reservation_key] = None
+        try:
+            stamps = await self._engine_core_rpc(
+                "track_streaming_interaction", stage_ids=[0], args=(internal_id, event_id)
+            )
+        except BaseException:
+            # Keep the placeholder so the caller's cancellation/error path can
+            # release the engine-side reservation exactly once.
+            raise
+        stamp = next((value for value in stamps if value is not None), None)
+        if stamp is not None:
+            reservations[reservation_key] = float(stamp)
+        else:
+            reservations.pop(reservation_key, None)
+        return stamp
+
+    async def release_streaming_interaction(self, request_id: str, event_id: str) -> None:
+        """Release a reservation that will not be delivered to the worker."""
+        internal_id = self._resolve_interaction_request(request_id)
+        reservations = self._interaction_reservations_map()
+        reservation_key = (internal_id, event_id)
+        if reservation_key not in reservations:
+            return
+        reservations.pop(reservation_key, None)
+        await self._engine_core_rpc("track_streaming_interaction", stage_ids=[0], args=(internal_id, event_id, False))
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        *,
+        interaction: OmniInteractionPrompt,
+        track_playback: bool = False,
+    ) -> float | None:
+        """Apply a midway interaction to an active streaming diffusion request.
+
+        ``request_id`` is the external id created by the server-side session,
+        matching the value passed to :meth:`generate`.
+        """
+        event = interaction.get("event")
+        prompt = event.get("prompt") if isinstance(event, dict) else None
+        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
+            raise ValueError("prompt must be non-empty")
+        transition_chunks = interaction.get("transition_chunks")
+        if transition_chunks is not None and transition_chunks < 0:
+            raise ValueError("transition_chunks must be >= 0")
+
+        internal_id = self._resolve_interaction_request(request_id)
+        event_id = interaction.get("event_id", "")
+        reservations = self._interaction_reservations_map()
+        reservation_key = (internal_id, event_id)
+        received_at = reservations.get(reservation_key)
+        reserved = reservation_key in reservations
+        reservation_attempted = track_playback and not reserved
+        try:
+            if reservation_attempted:
+                received_at = await self.reserve_streaming_interaction(request_id, event_id)
+                reserved = received_at is not None
+            # ``received_at`` is an engine-owned field. A direct caller may put
+            # one in the TypedDict, but it must never reach the runner unchanged.
+            interaction = {**interaction}
+            interaction.pop("received_at", None)
+            if received_at is not None:
+                interaction["received_at"] = received_at
+            await self.engine.submit_interaction_async(internal_id, interaction=interaction)
+        except BaseException:
+            if reserved or reservation_attempted:
+                try:
+                    await self.release_streaming_interaction(request_id, event_id)
+                except Exception:
+                    logger.debug("Failed to release interaction reservation", exc_info=True)
+            raise
+        else:
+            reservations.pop(reservation_key, None)
         if self.log_stats:
             logger.info("[AsyncOmni] Queued interaction for request %s", request_id)
+        return received_at
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
@@ -824,6 +939,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -832,8 +950,24 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Args:
             profile_prefix: Optional prefix for the trace file names.
             stages: List of stage IDs to profile. If None, profiles all stages.
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
         """
-        return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+        # Mirror upstream ExecutorBase.profile: forward the per-session
+        # controls as kwargs only when set, so workers without them keep
+        # working with plain (is_start, profile_prefix) args.
+        kwargs: dict[str, int] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        return await self.collective_rpc(
+            method="profile",
+            args=(True, profile_prefix),
+            kwargs=kwargs or None,
+            stage_ids=stages,
+        )
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.
@@ -903,6 +1037,28 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         )
         return all(self._coerce_stage_bool(result) for result in results)
 
+    async def release_kv_cache_memory(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Discard AR-stage KV memory after a completed generation pause.
+
+        EngineCore checks that the scheduler is paused and all executor
+        memory is resident. Diffusion stages have no KV cache to release.
+        Restore KV memory with ``wake_up(tags=["kv_cache"])`` before resuming.
+        """
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if not ar_stage_ids:
+            return
+        async with self._pause_cond:
+            if not self._paused:
+                raise RuntimeError("release_kv_cache_memory() requires a completed pause first")
+            await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
+        if 0 in ar_stage_ids:
+            await asyncio.wait_for(self._clear_frontend_mm_cache(), timeout=timeout)
+        await self._engine_core_rpc("release_kv_cache_memory", stage_ids=ar_stage_ids, timeout=timeout)
+        self._record_stage_sleep(ar_stage_ids, [CuMemTag.KV_CACHE.value])
+        self._hold_admission_until_resume = True
+
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
     ) -> list[OmniACK]:
@@ -926,6 +1082,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         engines have no EngineCore pause to hold, so ``wake_up`` restores
         admission and ``sleep → wake → generate`` keeps working.
         """
+        # Validate before touching admission state. Raising after
+        # ``_paused = True`` would wedge generate() for good: nothing was
+        # slept, so wake_up() has no tags to restore and never reaches the
+        # block that clears ``_paused``.
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
         # coroutines that already passed the pause check have submitted (or
@@ -933,13 +1095,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             self._paused = True
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
-
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         # EngineCore.sleep resets receiver caches itself; only clear P0 here.
         if 0 in ar_stage_ids:
             await self._clear_frontend_mm_cache()
 
         self._final_output_handler()
+        sleep_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
             self._hold_admission_until_resume = True
@@ -968,16 +1129,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
+            self._record_stage_sleep(ar_stage_ids, sleep_tags)
+            if level == 2:
+                self._level2_sleeping = True
 
         if diffusion_stage_ids:
-            final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
+            acks: list[OmniACK] = []
+            try:
+                acks = await self._sleep_diffusion(diffusion_stage_ids, level)
+            finally:
+                # A failed sleep may have released part of a stage, so wake_up must still reach it.
+                self._record_stage_sleep(diffusion_stage_ids, sleep_tags)
+                # Level 2 has discarded weights only where a replica finished its sleep.
+                if level == 2 and any(self._diffusion_ack_error(ack) is None for ack in acks):
+                    self._level2_sleeping = True
+            self._raise_on_diffusion_errors("handle_sleep_task", acks)
+            final_acks.extend(acks)
 
-        self._record_stage_sleep(
-            ar_stage_ids + diffusion_stage_ids,
-            [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value],
-        )
-        if level == 2:
-            self._level2_sleeping = True
         return final_acks
 
     async def _sleep_diffusion(self, stage_ids: list[int], level: int) -> list[OmniACK]:
@@ -989,14 +1157,44 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Sleep (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniSleepTask(level=level, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
+        return await self._resolve_diffusion_acks(rpc_results)
+
+    async def _resolve_diffusion_acks(self, rpc_results: list[Any]) -> list[OmniACK]:
+        """Resolve the ACKs of a diffusion worker RPC."""
         final_acks: list[OmniACK] = []
         for stage_res in rpc_results:
             worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
             for ack in worker_acks:
-                if ack is not None:
+                if ack is None:
+                    continue
+                # StagePool's result for a failed RPC has no task_id to resolve.
+                if not isinstance(ack, dict) or "task_id" in ack:
                     await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+                final_acks.append(ack)
         return final_acks
+
+    @classmethod
+    def _raise_on_diffusion_errors(cls, method: str, acks: list[OmniACK]) -> None:
+        errors = [error for ack in acks if (error := cls._diffusion_ack_error(ack))]
+        if errors:
+            raise RuntimeError(f"{method} failed: {'; '.join(errors)}")
+
+    @staticmethod
+    def _diffusion_ack_error(ack: OmniACK | dict[str, Any]) -> str | None:
+        # In-process stages return OmniACK, subprocess stages return its dict form,
+        # and StagePool returns {"supported": False, "error": ...} when the RPC failed.
+        if isinstance(ack, dict):
+            status, error_msg, rpc_error = ack.get("status"), ack.get("error_msg"), ack.get("error")
+            # A subprocess RPC error arrives as {"error": True, "reason": ...}.
+            if rpc_error is True:
+                rpc_error = ack.get("reason") or "RPC failed"
+            if not rpc_error and (ack.get("todo") or ack.get("supported") is False):
+                rpc_error = str(ack)
+        else:
+            status, error_msg, rpc_error = getattr(ack, "status", None), getattr(ack, "error_msg", None), None
+        if status == "ERROR":
+            return error_msg or "worker reported ERROR"
+        return rpc_error
 
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
         """Wake stages after sleep.
@@ -1052,11 +1250,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
+            self._clear_stage_sleep(ar_stage_ids, requested_tags)
 
+        for sid in diffusion_stage_ids:
+            final_acks.extend(await self._wake_diffusion([sid], requested_tags))
+            self._clear_stage_sleep([sid], requested_tags)
         if diffusion_stage_ids:
-            final_acks.extend(await self._wake_diffusion(diffusion_stage_ids, requested_tags))
+            await asyncio.sleep(0.1)
 
-        self._clear_stage_sleep(target_stage_ids, requested_tags)
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):
@@ -1083,22 +1284,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Wake-up (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniWakeTask(tags=requested_tags, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
-        final_acks: list[OmniACK] = []
-        for stage_res in rpc_results:
-            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
-            for ack in worker_acks:
-                if ack is not None:
-                    await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
-        await asyncio.sleep(0.1)
-        return final_acks
+        acks = await self._resolve_diffusion_acks(rpc_results)
+        self._raise_on_diffusion_errors("handle_wake_task", acks)
+        return acks
 
-    async def is_sleeping(self) -> bool:
-        """Return whether all stages are sleeping.
+    async def is_sleeping(self, stage_ids: list[int] | None = None) -> bool:
+        """Return whether all stages are sleeping, or with ``stage_ids``,
+        whether any of those stages is recorded as sleeping.
 
         TODO(AsyncOmni): query the orchestrator once all stage backends expose
         a real sleeping-state RPC. For now we track the requested state locally.
         """
+        if stage_ids is not None:
+            return bool(self._sleeping_tags_for_stages(stage_ids))
         return bool(getattr(self, "_sleeping_tags", None))
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -1182,21 +1380,108 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             request_id,
         )
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        """Start a new weight update.
+    def _weight_transfer_stage_ids(self) -> list[int]:
+        """Positional stage indices that have weight transfer configured.
 
-        Omni does not currently support weight transfer, so this is a no-op.
+        Mirrors the deploy semantics: pipeline-wide ``weight_transfer_config``
+        enables every stage; a stage-level override restricts it to that stage.
+        Stages without the feature must not receive lifecycle RPCs — their
+        workers would reject the methods.
+
+        Stage types expose the resolved config differently:
+        - AR/generation: ``pool.stage_vllm_config`` is an upstream
+          ``VllmConfig`` (its ``weight_transfer_config`` field).
+        - Diffusion (inline): ``pool.stage_client.od_config``.
+        - Diffusion (subprocess): ``pool.stage_client.proc_manager.od_config``.
         """
-        logger.debug("Weight update start requested (no-op in omni)")
+        enabled: list[int] = []
+        for index, pool in enumerate(getattr(self.engine, "stage_pools", [])):
+            cfg = getattr(pool, "stage_vllm_config", None)
+            if getattr(cfg, "weight_transfer_config", None) is not None:
+                enabled.append(index)
+                continue
+            diffusion_cfg = getattr(cfg, "diffusion_config", None)
+            if getattr(diffusion_cfg, "weight_transfer_config", None) is not None:
+                enabled.append(index)
+                continue
+            client = getattr(pool, "stage_client", None)
+            od_config = getattr(client, "od_config", None)
+            if od_config is None:
+                od_config = getattr(getattr(client, "proc_manager", None), "od_config", None)
+            if getattr(od_config, "weight_transfer_config", None) is not None:
+                enabled.append(index)
+        return enabled
+
+    @property
+    def weight_transfer_enabled(self) -> bool:
+        """Whether any stage was configured with weight transfer.
+
+        Used to gate the weight-transfer HTTP routes: the admin endpoints are
+        only mounted when the feature is actually enabled via
+        ``weight_transfer_config`` in the deploy config.
+        """
+        return bool(self._weight_transfer_stage_ids())
+
+    async def _weight_transfer_rpc(self, method: str, args: tuple[Any, ...] = ()) -> list[Any]:
+        """Run a weight-transfer lifecycle RPC on the enabled stages, failing on errors.
+
+        ``StagePool.collective_rpc`` reports per-stage failures as
+        ``{"supported": False, "error": ...}`` result dicts instead of raising,
+        so a naive call could return 200 to the HTTP client while one stage
+        silently failed. Any error result therefore raises here; each worker's
+        lifecycle methods reset their own per-stage state on failure, so the
+        surviving stages are left in a consistent idle state and the trainer
+        can retry the full protocol.
+        """
+        stage_ids = self._weight_transfer_stage_ids()
+        if not stage_ids:
+            raise RuntimeError("No stage has weight transfer enabled. Set weight_transfer_config in the deploy config.")
+        results = await self.collective_rpc(method=method, args=args, stage_ids=stage_ids)
+        for result in results:
+            if isinstance(result, dict) and (result.get("error") is not None or result.get("supported") is False):
+                raise RuntimeError(f"{method} failed on a stage: {result.get('error', result)}")
+        return results
+
+    async def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Initialize weight transfer mechanism across all stages.
+
+        Args:
+            init_info: Backend-specific initialization information
+        """
+        await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
+        logger.info("[%s] Weight transfer engine initialized", self._name)
+
+    async def start_weight_update(self) -> None:
+        """Start a new weight update session across configured stages.
+
+        Each worker delegates preparation to its configured WTE backend,
+        which owns whether the update uses layerwise reload.
+        """
+        await self._weight_transfer_rpc("start_weight_update")
+        logger.info("[%s] Weight update session started", self._name)
+
+    async def update_weights(self, update_info: dict) -> None:
+        """Send weight update chunk to all stages.
+
+        Args:
+            update_info: Backend-specific update information containing weight data
+        """
+        await self._weight_transfer_rpc("update_weights", (update_info,))
+        logger.debug("[%s] Weight chunk forwarded to stages", self._name)
 
     async def finish_weight_update(self, weight_version: str | None = None) -> None:
-        """Finish the current weight update.
+        """Finish the current weight update session across all stages.
 
-        Omni does not currently support weight transfer, so this is a no-op.
-        ``weight_version`` is accepted for upstream ``EngineClient`` protocol
-        compatibility (RLHF weight-transfer routers pass it positionally).
+        Calls ``finish_weight_update()`` on every stage's worker, finalizing
+        the weight transfer and resetting the update target.
+
+        Args:
+            weight_version: Accepted for upstream ``EngineClient`` protocol
+                compatibility (RLHF weight-transfer routers pass it positionally).
+                Currently unused by omni stages.
         """
-        logger.debug("Weight update finish requested (no-op in omni)")
+        await self._weight_transfer_rpc("finish_weight_update")
+        logger.info("[%s] Weight update session finished", self._name)
 
     async def do_log_stats(self) -> None:
         """Log statistics.
