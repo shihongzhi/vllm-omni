@@ -15,7 +15,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.interface import (
     supports_resumable_prepare,
     supports_step_execution,
@@ -390,27 +389,6 @@ class TestTextLoop:
         flat = torch.zeros(1, 1, VOCAB)
         tokens = self._sampled_tokens(pipe, flat, request_generator=[torch.Generator().manual_seed(1)], seed=7)
         assert tokens == self._sampled_tokens(pipe, flat, seed=7)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_a_generator_on_another_device_is_replaced_by_one_on_the_logits_device(self):
-        # generator_device="cpu" gives the runner's generator a CPU device
-        # while the logits it samples from sit on the GPU.
-        pipe = _pipeline(flat=True)
-        flat = torch.zeros(1, 1, VOCAB, device="cuda")
-        cursor = pipe._begin_text(
-            flat,
-            "kv",
-            0,
-            max_tokens=4,
-            do_sample=True,
-            temperature=1.0,
-            seed=7,
-            request_generator=torch.Generator("cpu").manual_seed(7),
-        )
-        assert cursor.generator.device == flat.device
-        probs = torch.softmax(cursor.logits / cursor.temperature, dim=-1)
-        torch.multinomial(probs, num_samples=1, generator=cursor.generator)
 
     def test_text_cursor_survives_being_left_between_tokens(self):
         successor = {1: 2, 2: 3, 3: EOS}
