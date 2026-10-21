@@ -240,6 +240,16 @@ def _build_abs_positions_from_grid_hw(grid_hw, device=None):
     return pid % W_per_patch, pid // W_per_patch
 
 
+@dataclass(frozen=True)
+class VisionGrid:
+    sizes: list[tuple[int, int]]
+    positions: tuple[torch.Tensor, torch.Tensor]
+
+    @classmethod
+    def from_tensor(cls, grid_hw: torch.Tensor) -> VisionGrid:
+        return cls([tuple(size) for size in grid_hw.tolist()], _build_abs_positions_from_grid_hw(grid_hw))
+
+
 class NEOVisionEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -275,12 +285,14 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("cos_cached_y", cos_y, persistent=False)
         self.register_buffer("sin_cached_y", sin_y, persistent=False)
 
-    def forward(self, pixel_values, grid_hw=None):
+    def forward(self, pixel_values, grid_hw=None, grid: VisionGrid | None = None):
         pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
 
         # 2D RoPE
-        abs_x, abs_y = _build_abs_positions_from_grid_hw(grid_hw)
+        if grid is None:
+            grid = VisionGrid.from_tensor(grid_hw)
+        abs_x, abs_y = grid.positions
         dim_half = self.embed_dim // 2
         p1 = _apply_rotary_emb_1d(
             patch_embeds[:, :dim_half].float(),
@@ -298,8 +310,7 @@ class NEOVisionEmbeddings(nn.Module):
 
         patches_list = []
         cur = 0
-        for i in range(grid_hw.shape[0]):
-            h, w = grid_hw[i]
+        for h, w in grid.sizes:
             pe = patch_embeds[cur : cur + h * w].view(h, w, -1).unsqueeze(0)
             pe = self.dense_embedding(pe.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             patches_list.append(pe.view(-1, pe.shape[-1]))
@@ -313,8 +324,8 @@ class NEOVisionModel(nn.Module):
         super().__init__()
         self.embeddings = NEOVisionEmbeddings(config)
 
-    def forward(self, pixel_values=None, grid_hw=None, **_kwargs):
-        return self.embeddings(pixel_values, grid_hw=grid_hw)
+    def forward(self, pixel_values=None, grid_hw=None, grid: VisionGrid | None = None, **_kwargs):
+        return self.embeddings(pixel_values, grid_hw=grid_hw, grid=grid)
 
 
 # ---------------------------------------------------------------------------
@@ -450,16 +461,19 @@ def get_sensenova_u1_pre_process_func(od_config: OmniDiffusionConfig):
     is exactly what ``prepare_steps_remaining`` reports while it is queued.
     """
 
-    step_execution = bool(getattr(od_config, "step_execution", False))
-
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         extra_args = request.sampling_params.extra_args or {}
         # Same resolution and comparison as ``_parse_request`` /
         # ``prepare_encode``, so the key cannot drift from the derived flag.
         cfg_scale = float(extra_args.get("cfg_scale", 4.0))
         request.batch_compatibility_key = ("sensenova_u1_cfg", cfg_scale > 1)
+        # ``od_config.step_execution`` is read per request, not captured when
+        # the engine builds this hook: with ``streaming_output=True`` the
+        # engine's ``_resolve_execution_mode`` flips ``step_execution`` on
+        # only after the hooks exist, so a captured copy would stay False and
+        # a text request would keep ``num_inference_steps=None``.
         if (
-            step_execution
+            bool(getattr(od_config, "step_execution", False))
             and request.sampling_params.num_inference_steps is None
             and isinstance(request.prompt, dict)
             and "text" in (request.prompt.get("modalities") or [])
@@ -557,10 +571,10 @@ def _release_denoise_caches(caches: dict | None) -> None:
     """Release a request's denoise flash KV caches (idempotent, None-safe).
 
     Clearing the dict makes a repeat release a no-op, which the step paths
-    rely on: ``post_decode`` releases on the way out and the ``weakref``
-    backstop attached in ``prepare_encode`` releases again once the runner
-    drops the state of a request that never reached ``post_decode`` — an
-    abort, an interrupt, or a failure.
+    rely on: ``post_decode`` releases on the way out and the runner's
+    retirement hook (``release_step_request``) releases again once it pops
+    the state of a request that never reached ``post_decode`` — an abort,
+    an interrupt, or a failure.
     """
 
     if not caches:
@@ -570,17 +584,6 @@ def _release_denoise_caches(caches: dict | None) -> None:
         if value is not None and not isinstance(value, dict):
             clear_flash_kv_cache(value)
     caches.clear()
-
-
-def _release_step_caches(step: SimpleNamespace | None) -> None:
-    """``weakref.finalize`` target: release the caches of a retired request.
-
-    Takes the step context rather than its caches dict because the dict is
-    only assembled when the prepare phase ends — after ``prepare_encode``
-    has attached this release to the state's lifetime.
-    """
-
-    _release_denoise_caches(step.caches if step is not None else None)
 
 
 class SenseNovaU1Pipeline(
@@ -792,9 +795,9 @@ class SenseNovaU1Pipeline(
                 "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
             )
 
-    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None):
+    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None, grid: VisionGrid | None = None):
         if gen_model:
-            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw)
+            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw, grid=grid)
         return self.vision_model(pixel_values=pixel_values, grid_hw=grid_hw)
 
     def _build_t2i_text_inputs(self, query):
@@ -900,9 +903,8 @@ class SenseNovaU1Pipeline(
         denoising_model = self.language_model if cache_dit_skip else self.denoising_transformer
         outputs = denoising_model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
-                (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
-            ),
+            exist_und=False,
+            exist_gen=True,
             indexes=indexes_image,
             attention_mask=attn_mask,
             past_key_values=past_key_values,
@@ -1405,15 +1407,13 @@ class SenseNovaU1Pipeline(
             kwargs["cache_dit_skip"] = True
         return kwargs
 
-    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg: bool):
         if not is_it2i:
-            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
-            if not (in_interval and p.cfg_scale > 1):
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
@@ -1427,14 +1427,11 @@ class SenseNovaU1Pipeline(
             )
             return noise_pred
         else:
-            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
-            needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
-            has_cached_partner = use_cfg and needs_cfg
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            if not use_cfg or not needs_cfg:
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
@@ -1792,12 +1789,45 @@ class SenseNovaU1Pipeline(
         caches, think_text = self._it2i_caches(p, ns, ctx)
         return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=True)
 
-    def _denoise_one(self, image_prediction, ns, caches, p, step_i, is_it2i):
+    def _denoise_context(self, ns, p, is_it2i: bool) -> SimpleNamespace:
+        """Per-request values hoisted out of the per-step denoise body (#8254).
+
+        The CFG interval decision, the vision grid, and the noise-scale
+        embedding depend only on the request's schedule and parsed params, so
+        they are computed once per request — in ``prepare_encode`` for step
+        execution, at loop entry for the batched loop — instead of repeating
+        the tensor comparisons and the ``.tolist()`` host sync every step.
+        """
+        grid = VisionGrid.from_tensor(ns.grid_hw)
+        times = ns.timesteps[:-1]
+        if is_it2i:
+            cfg_steps = ((times > p.cfg_interval[0]) & (times < p.cfg_interval[1])) | (p.cfg_interval[0] == 0)
+            cfg_steps &= p.cfg_scale != 1 or p.img_cfg_scale != 1
+        else:
+            cfg_steps = (times >= p.cfg_interval[0]) & (times <= p.cfg_interval[1])
+            cfg_steps &= p.cfg_scale > 1
+        noise_scale_emb = None
+        if self.model_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full(
+                (p.batch_size * ns.token_h * ns.token_w,),
+                ns.noise_scale / self.model_cfg.noise_scale_max_value,
+                dtype=ns.timesteps.dtype,
+                device=ns.timesteps.device,
+            )
+            noise_scale_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
+                p.batch_size, ns.token_h * ns.token_w, -1
+            )
+        return SimpleNamespace(grid=grid, cfg_steps=cfg_steps.tolist(), noise_scale_emb=noise_scale_emb)
+
+    def _denoise_one(self, image_prediction, ns, caches, p, step_i, is_it2i, ctx):
         """One denoise forward. Returns the patchified latents and the velocity.
 
         ``z`` is handed back rather than rebuilt in ``_advance_latents``: it is a
         full-size copy of the image, and the Euler update needs exactly the one
         the forward ran against.
+
+        ``ctx`` is the request's ``_denoise_context``; the per-step CFG decision
+        is the precomputed ``cfg_steps[step_i]`` entry, not a fresh comparison.
         """
         t = ns.timesteps[step_i]
 
@@ -1807,6 +1837,7 @@ class SenseNovaU1Pipeline(
             image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
             gen_model=True,
             grid_hw=ns.grid_hw,
+            grid=ctx.grid,
         ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
         t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
@@ -1815,17 +1846,13 @@ class SenseNovaU1Pipeline(
             ns.token_h * ns.token_w,
             -1,
         )
-        if self.model_cfg.add_noise_scale_embedding:
-            ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
-            ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
-                p.batch_size,
-                ns.token_h * ns.token_w,
-                -1,
-            )
-            timestep_embeddings = timestep_embeddings + ns_emb
+        if ctx.noise_scale_emb is not None:
+            timestep_embeddings = timestep_embeddings + ctx.noise_scale_emb
         image_embeds = image_embeds + timestep_embeddings
 
-        return z, self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
+        return z, self._denoise(
+            image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, ctx.cfg_steps[step_i]
+        )
 
     def _advance_latents(self, z, ns, p, step_i, v_pred):
         """Euler update for one flow-matching step."""
@@ -1860,10 +1887,11 @@ class SenseNovaU1Pipeline(
         released on normal completion and on exception paths alike.
         """
         image_prediction = ns.image_prediction
+        ctx = self._denoise_context(ns, p, is_it2i)
 
         try:
             for step_i in range(p.num_steps):
-                z, v_pred = self._denoise_one(image_prediction, ns, caches, p, step_i, is_it2i)
+                z, v_pred = self._denoise_one(image_prediction, ns, caches, p, step_i, is_it2i, ctx)
                 image_prediction = self._advance_latents(z, ns, p, step_i, v_pred)
         finally:
             _release_denoise_caches(caches)
@@ -1918,6 +1946,7 @@ class SenseNovaU1Pipeline(
                 cursor=None,
                 queued=False,
                 input_images=input_images,
+                denoise_ctx=None,
             )
             if self._acquire_ar_decode(state):
                 step.cursor = self._begin_text_request(p, input_images)
@@ -1938,6 +1967,7 @@ class SenseNovaU1Pipeline(
                 cursor=None,
                 queued=False,
                 input_images=input_images,
+                denoise_ctx=self._denoise_context(ns, p, input_images is not None),
             )
             # ``ns.timesteps`` holds num_steps + 1 boundaries; the request takes
             # one step per interval, so the state carries the intervals and the
@@ -1962,14 +1992,6 @@ class SenseNovaU1Pipeline(
             # A request that asked for no tokens at all has an empty loop, and
             # its prepare phase is over before it starts.
             self._finish_prepare(state)
-        # The shared runner retires an aborted, interrupted, or failed request
-        # by dropping its state — there is no pipeline-visible retirement
-        # callback — so the request-scoped flash KV caches are released
-        # attached to the state's lifetime rather than left to tensor
-        # refcounting. Idempotent with the release ``post_decode`` runs; the
-        # step context is captured (not its caches) because the caches are
-        # only assembled when the prepare phase ends.
-        weakref.finalize(state, _release_step_caches, step)
         return state
 
     def prepare_steps_remaining(self, state: StepRequestState) -> int | None:
@@ -2084,6 +2106,7 @@ class SenseNovaU1Pipeline(
                 step.p,
                 state.step_index,
                 step.mode == "it2i",
+                step.denoise_ctx,
             )
             predictions.append(prediction)
         if len(predictions) == 1:
@@ -2106,17 +2129,25 @@ class SenseNovaU1Pipeline(
     def release_step_state(self, state: StepRequestState, *, aborted: bool = False) -> None:
         """Release what this request still holds: flash caches and decode ownership.
 
-        ``post_decode`` routes its cleanup through here, and tests call it
-        directly; the ``weakref`` backstop attached in ``prepare_encode``
-        covers a request the runner drops without a ``post_decode``. Both
-        releases are idempotent, so the backstop is a no-op on the normal
-        path.
+        ``post_decode`` routes its cleanup through here, the shared runner's
+        retirement hook reaches it via ``release_step_request`` for every
+        popped state, and tests call it directly. It is idempotent, so any
+        of these firing more than once is a no-op.
         """
         del aborted
         self._release_ar_decode(state)
         step = state.extra.get(self._STEP_KEY)
         if step is not None:
             _release_denoise_caches(step.caches)
+
+    def release_step_request(self, state: StepRequestState) -> None:
+        """Runner retirement hook (#8859): release a popped request's state.
+
+        The shared runner calls this for every state it pops — finished,
+        aborted, or failed — so request-owned cleanup no longer depends on a
+        ``post_decode`` running. Delegates to ``release_step_state``.
+        """
+        self.release_step_state(state)
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Build the output and release whatever this request still holds."""

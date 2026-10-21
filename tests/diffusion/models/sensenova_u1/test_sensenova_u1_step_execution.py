@@ -202,7 +202,9 @@ class TestDecodeOwnership:
 
     def test_a_queued_think_request_begins_when_the_buffers_free_up(self):
         pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
-        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        schedule = SimpleNamespace(
+            image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4), grid_hw=torch.tensor([[4, 4]])
+        )
         pipe._init_noise_and_schedule = lambda p: schedule
         prefix_calls = []
 
@@ -238,7 +240,9 @@ class TestDecodeOwnership:
     def test_requests_without_a_decode_never_queue(self):
         """A non-thinking image request prepares fully behind a live decode."""
         pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
-        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        schedule = SimpleNamespace(
+            image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4), grid_hw=torch.tensor([[4, 4]])
+        )
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
@@ -388,7 +392,6 @@ class TestTextLoop:
         assert tokens == self._sampled_tokens(pipe, flat, seed=7)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    @pytest.mark.cuda
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_a_generator_on_another_device_is_replaced_by_one_on_the_logits_device(self):
         # generator_device="cpu" gives the runner's generator a CPU device
@@ -447,6 +450,9 @@ def _text_pipeline(successor: dict[int, int], first_token: int) -> SenseNovaU1Pi
     pipe.patch_size = 16
     pipe.merge_size = 2
     pipe.od_config = SimpleNamespace(step_execution=True, max_num_seqs=1)
+    # ``prepare_encode`` precomputes the denoise context; with the embedding
+    # off it only needs the schedule's grid, which the stubs below provide.
+    pipe.model_cfg = SimpleNamespace(add_noise_scale_embedding=False, noise_scale_max_value=2.0)
     return pipe
 
 
@@ -506,7 +512,9 @@ class TestPrepareProtocolOnTheRealPipeline:
 
     def test_image_request_is_ready_to_denoise_when_think_is_off(self):
         pipe = _text_pipeline({1: EOS}, first_token=1)
-        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        schedule = SimpleNamespace(
+            image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4), grid_hw=torch.tensor([[4, 4]])
+        )
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
@@ -522,7 +530,9 @@ class TestPrepareProtocolOnTheRealPipeline:
 
     def test_image_request_with_think_prepares_before_it_denoises(self):
         pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
-        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        schedule = SimpleNamespace(
+            image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4), grid_hw=torch.tensor([[4, 4]])
+        )
         pipe._init_noise_and_schedule = lambda p: schedule
         cursor = _think_cursor(pipe, first_token=1)
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=cursor, past_kv_cond=None)
@@ -639,7 +649,7 @@ class TestThroughTheRunner:
         pipe.patch_size, pipe.merge_size = 16, 1
         latents = torch.zeros(1, 4, 16 * 16 * 3)
         timesteps = torch.tensor([0.0, 0.25, 0.75, 1.0])
-        schedule = SimpleNamespace(image_prediction=latents, timesteps=timesteps)
+        schedule = SimpleNamespace(image_prediction=latents, timesteps=timesteps, grid_hw=torch.tensor([[4, 4]]))
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
         pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
@@ -652,7 +662,7 @@ class TestThroughTheRunner:
         seen: list[int] = []
         edit_flags: list[bool] = []
 
-        def _denoise_one(z, ns, caches, p, step_i, is_edit):
+        def _denoise_one(z, ns, caches, p, step_i, is_edit, ctx=None):
             # Production re-patchifies the latents each step and returns the
             # patched tensor alongside the prediction, so the Euler update in
             # `_advance_latents` operates on the patched layout.

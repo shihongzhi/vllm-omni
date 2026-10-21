@@ -22,7 +22,6 @@ slice, with ``post_decode`` firing per request as soon as its own schedule is
 exhausted.
 """
 
-import gc
 import types
 
 import numpy as np
@@ -71,13 +70,13 @@ class _Recorder:
         self.denoise_calls: list[dict] = []
         self.cleaned: list[object] = []
 
-    def extract_feature(self, image_input, gen_model, grid_hw):
+    def extract_feature(self, image_input, gen_model, grid_hw, grid=None):
         self.extract_calls.append(image_input.clone())
         pooled = image_input.float().mean(dim=-1, keepdim=True)
         embeds = pooled.expand(*image_input.shape[:-1], DIM)
         return (embeds * 7.0).to(image_input.dtype)
 
-    def denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg=False):
         self.denoise_calls.append(
             {
                 "image_prediction": image_prediction.clone(),
@@ -86,6 +85,7 @@ class _Recorder:
                 "image_embeds": image_embeds.clone(),
                 "step_i": step_i,
                 "is_it2i": is_it2i,
+                "use_cfg": use_cfg,
             }
         )
         return torch.tanh(z) * (1.0 - t) + 0.25
@@ -140,10 +140,20 @@ def _track_cleanup(monkeypatch, recorder):
     monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: recorder.cleaned.append(cache))
 
 
-def _build_step_request(ns, caches, request_id="req-1", think_text="", is_it2i=False, num_steps=STEPS):
+def _build_step_request(
+    ns, caches, request_id="req-1", think_text="", is_it2i=False, num_steps=STEPS, cfg_interval=(0.0, 1.0)
+):
     """Assemble the StepRequestState exactly as prepare_encode lays it out."""
     req = StepRequestState(request_id=request_id, sampling=types.SimpleNamespace(), prompt="a cat")
-    p = types.SimpleNamespace(batch_size=BATCH, num_steps=num_steps, image_size=[H, W])
+    p = types.SimpleNamespace(
+        batch_size=BATCH,
+        num_steps=num_steps,
+        image_size=[H, W],
+        cfg_interval=list(cfg_interval),
+        cfg_scale=4.0,
+        img_cfg_scale=4.0,
+        cfg_norm=None,
+    )
     step = types.SimpleNamespace(
         mode="it2i" if is_it2i else "t2i",
         p=p,
@@ -156,6 +166,8 @@ def _build_step_request(ns, caches, request_id="req-1", think_text="", is_it2i=F
         cursor=None,
         queued=False,
         input_images=None,
+        # The same per-request precompute prepare_encode stores on the context.
+        denoise_ctx=_make_setup()._denoise_context(ns, p, is_it2i),
     )
     req.latents = ns.image_prediction
     req.timesteps = ns.timesteps[:-1]
@@ -289,7 +301,14 @@ def test_step_execution_matches_full_request_path(think_text, is_it2i, monkeypat
 
 
 def _ns_params():
-    return types.SimpleNamespace(batch_size=BATCH, num_steps=STEPS, image_size=[H, W])
+    return types.SimpleNamespace(
+        batch_size=BATCH,
+        num_steps=STEPS,
+        image_size=[H, W],
+        cfg_interval=[0.0, 1.0],
+        cfg_scale=4.0,
+        img_cfg_scale=4.0,
+    )
 
 
 def test_step_scheduler_update_matches_reference_euler_step():
@@ -356,6 +375,51 @@ def test_denoise_step_concatenates_and_slices_per_request():
     assert offset == v_pred.shape[0]
     assert req_a.step_index == 1
     assert req_b.step_index == 2
+
+
+@pytest.mark.parametrize("is_it2i", [False, True])
+def test_denoise_step_runs_the_real_denoise_and_honors_cfg_boundaries(is_it2i):
+    """The step path must feed the real ``_denoise`` the precomputed CFG decisions.
+
+    The other step tests stub ``_denoise_one`` and the loop tests stub
+    ``_denoise``, so nothing else pins the ``denoise_step`` chain against
+    #8254's hoisting: a ``use_cfg`` that drifted from ``_denoise_context``
+    (or a per-step recomputation of it) would go unnoticed. Here only the
+    branch kwargs builder and the noise predictors are stubbed, so the real
+    ``denoise_step`` -> ``_denoise_one`` -> ``_denoise`` chain runs, and the
+    cond branch's ``cache_dit_skip`` flag reveals the per-step ``use_cfg``.
+
+    Schedule [1.0, 0.8, 0.6, 0.4, 0.2] against interval (0.5, 0.9): CFG
+    runs on 0.8 and 0.6 only — the boundaries themselves are excluded on
+    the it2i (strict) comparison and included nowhere at 1.0/0.2.
+    """
+    steps = 5
+    pipe = _make_setup()
+    cond_calls: list[tuple[float, bool]] = []
+
+    def _get_cfg_kwargs(caches, image_embeds, t, z, ns, p, *, branch, **kwargs):
+        if branch == "cond":
+            # cond is requested first every step; cache_dit_skip is not use_cfg.
+            cond_calls.append((float(t), not kwargs.get("cache_dit_skip", False)))
+        return {"z": z}
+
+    pipe._get_cfg_kwargs = _get_cfg_kwargs
+    pipe._extract_feature = lambda image_input, gen_model=False, grid_hw=None, grid=None: torch.zeros(
+        image_input.shape[0], DIM
+    )
+    pipe.predict_noise = lambda **kwargs: torch.zeros_like(kwargs["z"])
+    pipe.predict_noise_maybe_with_cfg = lambda **kwargs: torch.zeros_like(kwargs["positive_kwargs"]["z"])
+
+    ns = _make_ns(steps=steps)
+    caches = _make_caches()
+    req = _build_step_request(ns, caches, is_it2i=is_it2i, num_steps=steps, cfg_interval=(0.5, 0.9))
+
+    while not req.denoise_completed:
+        v_pred = pipe.denoise_step(None, states=[req])
+        pipe.step_scheduler(req, v_pred)
+
+    assert [use_cfg for _, use_cfg in cond_calls] == [False, True, True, False, False]
+    assert [t for t, _ in cond_calls] == [float(t) for t in ns.timesteps[:-1]]
 
 
 def test_step_batch_matches_sequential_execution(monkeypatch):
@@ -497,12 +561,11 @@ def test_mid_flight_admission_continues_older_request(monkeypatch):
 def test_aborted_request_peer_unaffected(monkeypatch):
     """Aborting one request mid-denoise releases its caches and spares peers.
 
-    The abort takes effect at a wave boundary: the runner retires the request
-    by dropping its state, and the pipeline frees the request-local caches
-    from the finalize hook ``prepare_encode`` attached to that state (the same
-    idempotent release ``post_decode`` runs on the completion path, which this
-    request never reaches). The wave peer keeps evolving exactly as a solo
-    run.
+    The abort takes effect at a wave boundary: the runner pops the request's
+    state and routes it through the pipeline retirement hook
+    (``release_step_request``, the same idempotent release ``post_decode``
+    runs on the completion path, which this request never reaches). The wave
+    peer keeps evolving exactly as a solo run.
     """
     solo_calls, solo_out, _ = _solo_run(monkeypatch, seed=1234, request_id="req-a")
 
@@ -513,7 +576,7 @@ def test_aborted_request_peer_unaffected(monkeypatch):
     cond_a = caches_a["cond"]
     req_a = _build_step_request(_make_ns(seed=1234), caches_a, request_id="req-a")
     # Admit req-b the way the runner does, through the real prepare_encode, so
-    # the finalize release is registered exactly as in serving.
+    # its caches are the ones the pipeline owns for the request.
     req_b = _admit_request(pipe, "req-b")
     caches_b = req_b.extra[SenseNovaU1Pipeline._STEP_KEY].caches
     cond_b = caches_b["cond"]
@@ -521,10 +584,9 @@ def test_aborted_request_peer_unaffected(monkeypatch):
 
     _drive_wave(pipe, [req_a, req_b])
 
-    # Cancel req-b between waves: the runner pops the state and drops every
-    # reference to it; the finalize release fires on collection.
-    del req_b
-    gc.collect()
+    # Cancel req-b between waves: the runner retires the request without a
+    # post_decode, by popping the state and calling the retirement hook.
+    pipe.release_step_request(req_b)
     assert recorder.cleaned == [cond_b, uncond_b]
     assert not caches_b
 
@@ -678,6 +740,11 @@ class TestThroughTheRunner:
         schedule = types.SimpleNamespace(
             image_prediction=torch.zeros(1, 3, 32, 32),
             timesteps=torch.tensor([0.0, 0.25, 0.75, 1.0]),
+            # prepare_encode precomputes the denoise context off the schedule.
+            grid_hw=torch.tensor([[16, 16]]),
+            token_h=16,
+            token_w=16,
+            noise_scale=0.5,
         )
         pipe._init_noise_and_schedule = lambda p: schedule
         pipe._t2i_prefix = lambda p, ns: types.SimpleNamespace(cursor=None, past_kv_cond="kv")
@@ -685,7 +752,7 @@ class TestThroughTheRunner:
         seen_steps: list[int] = []
         v_pred = torch.full((1, 64, 3 * 16), 2.0)
 
-        def _denoise_one(image_prediction, ns, caches, p, step_i, is_edit):
+        def _denoise_one(image_prediction, ns, caches, p, step_i, is_edit, ctx=None):
             seen_steps.append(step_i)
             return torch.zeros_like(v_pred), v_pred
 
@@ -785,9 +852,12 @@ class TestCfgSwitchAdmission:
         extra_args: dict | None = None,
         steps: int | None = 3,
     ):
-        from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
-            get_sensenova_u1_pre_process_func,
-        )
+        # Resolve through the registry — not by importing
+        # ``get_sensenova_u1_pre_process_func`` directly — so the test also
+        # pins the ``_DIFFUSION_PRE_PROCESS_FUNCS`` entry the engine uses;
+        # without it the engine silently loses the CFG key and the text
+        # prepare budget while these tests keep passing.
+        from vllm_omni.diffusion.registry import get_diffusion_pre_process_func
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -801,7 +871,10 @@ class TestCfgSwitchAdmission:
                 num_inference_steps=steps, seed=42, width=32, height=32, extra_args=merged_extra
             ),
         )
-        return get_sensenova_u1_pre_process_func(types.SimpleNamespace(step_execution=step_execution))(request)
+        od_config = types.SimpleNamespace(model_class_name="SenseNovaU1Pipeline", step_execution=step_execution)
+        pre_process_func = get_diffusion_pre_process_func(od_config)
+        assert pre_process_func is not None, "SenseNovaU1Pipeline must stay registered in _DIFFUSION_PRE_PROCESS_FUNCS"
+        return pre_process_func(request)
 
     def test_pre_process_publishes_derived_cfg_switch(self):
         assert self._request("a").batch_compatibility_key == ("sensenova_u1_cfg", True)

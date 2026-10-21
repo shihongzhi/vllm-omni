@@ -365,7 +365,7 @@ def test_worker_retires_only_the_failed_wave_even_before_runner_execution(failur
     worker.model_runner = runner
     worker._step_lora_state = {"failed": (object(), 1.0), "live": (None, 0.5)}
     error = RuntimeError(f"injected {failure} failure")
-    worker.lora_manager = SimpleNamespace(set_active_adapter=Mock(side_effect=error if failure == "lora" else None))
+    worker.lora_manager = SimpleNamespace(set_request_adapter=Mock(side_effect=error if failure == "lora" else None))
 
     @contextmanager
     def profiler_context():

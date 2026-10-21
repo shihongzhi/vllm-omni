@@ -56,11 +56,11 @@ class _Recorder:
         self.cleaned: list[object] = []
         self.gen = torch.Generator().manual_seed(4242)
 
-    def extract_feature(self, image_input, gen_model, grid_hw):
+    def extract_feature(self, image_input, gen_model, grid_hw, grid=None):
         self.extract_calls.append(image_input.clone())
         return torch.randn(image_input.shape[0], DIM, generator=self.gen)
 
-    def denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg=False):
         self.denoise_calls.append(
             {
                 "image_prediction": image_prediction.clone(),
@@ -69,6 +69,7 @@ class _Recorder:
                 "image_embeds": image_embeds.clone(),
                 "step_i": step_i,
                 "is_it2i": is_it2i,
+                "use_cfg": use_cfg,
             }
         )
         return torch.randn(z.shape, generator=self.gen)
@@ -103,7 +104,14 @@ def _make_setup():
         "uncond": object(),
         "img_cond": {"nested": True},  # dict entries must be skipped by cleanup
     }
-    p = types.SimpleNamespace(batch_size=BATCH, num_steps=STEPS, image_size=[H, W])
+    p = types.SimpleNamespace(
+        batch_size=BATCH,
+        num_steps=STEPS,
+        image_size=[H, W],
+        cfg_interval=[0.0, 1.0],
+        cfg_scale=4.0,
+        img_cfg_scale=4.0,
+    )
     return pipe, ns, caches, p
 
 
@@ -241,7 +249,7 @@ def test_cleanup_after_partial_steps_covers_abort_path(monkeypatch):
     monkeypatch.setattr(pipe_mod, "clear_flash_kv_cache", lambda cache: released.append(cache))
     cond, uncond = caches["cond"], caches["uncond"]
 
-    pipe._denoise_one(ns.image_prediction, ns, caches, p, 0, is_it2i=False)
+    pipe._denoise_one(ns.image_prediction, ns, caches, p, 0, False, pipe._denoise_context(ns, p, False))
     pipe_mod._release_denoise_caches(caches)
 
     assert len(recorder.denoise_calls) == 1
