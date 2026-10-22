@@ -226,6 +226,31 @@ def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
     assert not hasattr(runner, "graph_runners")
 
 
+def test_release_step_requests_routes_popped_states_to_the_pipeline_hook():
+    """Every popped state reaches ``pipeline.release_step_request`` (#8859).
+
+    With the ``weakref`` backstop gone from ``prepare_encode``, this hook is
+    what releases an aborted or failed SenseNova request's caches; a runner
+    test has to pin it because the pipeline-side tests call the method
+    directly.
+    """
+    retired = StepRequestState(request_id="req", sampling=SimpleNamespace(), prompt="p")
+    uncached = StepRequestState(request_id="uncached", sampling=SimpleNamespace(), prompt="p")
+    received: list[StepRequestState] = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.state_cache = {"req": retired, "uncached": uncached}
+    runner.input_batch = None
+    runner.pipeline = SimpleNamespace(release_step_request=received.append)
+
+    released = runner.release_step_requests(["req", "gone", "uncached"])
+
+    assert released == 2
+    # Order follows the pop of each cached state; ids without state (the
+    # already-released "gone") reach neither the hook nor the count.
+    assert received == [retired, uncached]
+    assert runner.state_cache == {}
+
+
 def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()

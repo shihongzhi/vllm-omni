@@ -908,6 +908,38 @@ class TestCfgSwitchAdmission:
         text_request_mode = self._request("r", modalities=["text"])
         assert text_request_mode.sampling_params.num_inference_steps == 3
 
+    def test_pre_process_reads_step_execution_at_request_time(self):
+        """The flag is read per request, not captured at hook construction.
+
+        The engine builds these hooks before ``_resolve_execution_mode`` flips
+        ``od_config.step_execution`` on for ``streaming_output=True``; a
+        captured copy would stay False and the text request would keep
+        ``num_inference_steps=None``.
+        """
+        from vllm_omni.diffusion.registry import get_diffusion_pre_process_func
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        od_config = types.SimpleNamespace(model_class_name="SenseNovaU1Pipeline", step_execution=False)
+        pre_process_func = get_diffusion_pre_process_func(od_config)
+        assert pre_process_func is not None
+        # What the engine's _resolve_execution_mode does after hook
+        # construction for streaming_output=True:
+        od_config.step_execution = True
+
+        request = OmniDiffusionRequest(
+            prompt={"prompt": "describe the sky", "modalities": ["text"]},
+            request_id="late-flag",
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=None,
+                seed=42,
+                width=32,
+                height=32,
+                extra_args={"max_tokens": 64},
+            ),
+        )
+        assert pre_process_func(request).sampling_params.num_inference_steps == 65
+
     def test_shared_batch_state_rejects_mixed_derived_flags(self):
         from vllm_omni.diffusion.worker.input_batch import _prepare_cfg_scalars
 
