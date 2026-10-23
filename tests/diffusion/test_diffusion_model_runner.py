@@ -964,10 +964,16 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     synchronize = Mock()
     monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", synchronize)
+    retired = []
+    monkeypatch.setattr(runner.pipeline, "release_step_request", retired.append, raising=False)
 
     runner.profile_run(requests)
 
     assert observed_batch_rows == [(2, 2)]
+    # Every profile state retires through the pipeline hook exactly once,
+    # whether the wave or the finally block is what ended it.
+    assert sorted(state.request_id for state in retired) == ["profile-0", "profile-1"]
+    assert len(retired) == 2
     assert runner.state_cache == {}
     assert runner.input_batch is None
     # Both preparation and denoising must retain the startup profiling scope.
@@ -976,6 +982,49 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_retires_unfinished_states_through_the_hook(monkeypatch):
+    """Profiling stops after the first denoise batch, before post_decode.
+
+    With a schedule longer than one step the requests are still mid-flight
+    when the profile ends, so the ``finally`` block is the only retirement
+    they get — it must reach the pipeline hook rather than bare-pop them.
+    """
+
+    class _TwoStepPipeline(_FinalOnlyStepPipeline):
+        def prepare_encode(self, state):
+            state = super().prepare_encode(state)
+            state.timesteps = torch.tensor([1.0, 0.5])
+            return state
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _TwoStepPipeline()
+    runner.od_config.step_execution = True
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id = "profile-0"
+    requests[1].request_id = "profile-1"
+    for request in requests:
+        request.sampling_params.num_inference_steps = 2
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", Mock())
+    runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
+    retired = []
+    monkeypatch.setattr(runner.pipeline, "release_step_request", retired.append, raising=False)
+
+    runner.profile_run(requests)
+
+    # The first denoise wave built the batch; neither request finished, so
+    # only the profile's finally retired them — through the hook.
+    assert [state.request_id for state in retired] == ["profile-0", "profile-1"]
+    assert all(state.step_index == 1 for state in retired)
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
 
 
 class _BatchPipeline:

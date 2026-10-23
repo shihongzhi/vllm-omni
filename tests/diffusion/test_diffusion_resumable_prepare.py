@@ -576,10 +576,13 @@ class TestResumablePrepare:
         pipeline = _TextOnlyPipeline(prepare_steps=2)
         runner = _make_runner(pipeline)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        retired = []
+        pipeline.release_step_request = retired.append
 
         first = DiffusionModelRunner.execute_stepwise(runner, _new_output())
         assert first.get_request_output("req-1").finished is False
         assert pipeline.decode_calls == 0
+        state = runner.state_cache["req-1"]
 
         second = DiffusionModelRunner.execute_stepwise(runner, _cached_output())
         request_output = second.get_request_output("req-1")
@@ -587,6 +590,10 @@ class TestResumablePrepare:
         assert request_output.result.output == {"payload": {"text": "done"}}
         assert pipeline.decode_calls == 1
         assert "req-1" not in runner.state_cache
+        # The request is terminal without the denoise loop, so its retirement
+        # must still go through the pipeline hook — exactly once, with the
+        # cached state object itself.
+        assert retired == [state]
 
     def test_prepare_only_request_sends_its_stage_payload_once(
         self,

@@ -1097,8 +1097,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 )
             current_omni_platform.synchronize()
         finally:
-            for request_id in request_ids:
-                self.state_cache.pop(request_id, None)
+            # Profiling stops before any post_decode, so this is the only
+            # place the pipeline can release the profile states' request-owned
+            # resources; gc.collect() does not substitute for the retirement
+            # hook.
+            self.release_step_requests(request_ids)
             self.input_batch = None
             del runner_output
             gc.collect()
@@ -1189,7 +1192,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             released += 1
             if callable(release):
                 release(state)
-        batch = self.input_batch
+        batch = getattr(self, "input_batch", None)
         if batch is not None and not set(unique_request_ids).isdisjoint(batch.request_ids):
             self.input_batch = None
         return released
@@ -1244,8 +1247,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if context is not None:
                     state.interaction_boundary = context
         except Exception:
-            for request_id in new_request_ids:
-                self.state_cache.pop(request_id, None)
+            # These states were created here but never reached the pipeline,
+            # so the hook is a no-op for them; routing through the shared
+            # helper anyway keeps release_step_requests the only pop path.
+            self.release_step_requests(new_request_ids)
             raise
 
         return resolved, new_request_ids
@@ -1431,7 +1436,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if record_output_peak_memory and is_primary and current_omni_platform.is_available():
                     state.peak_memory_mb = max(state.peak_memory_mb, self._sample_peak_memory_mb())
                     result.peak_memory_mb = max(result.peak_memory_mb, state.peak_memory_mb)
-                self.state_cache.pop(state.request_id, None)
+                # The request is terminal here without ever reaching the
+                # denoise loop's retirement, so it goes through the shared
+                # release path like every other finished request.
+                self.release_step_requests([state.request_id])
                 outputs.append(
                     RunnerOutput(
                         request_id=state.request_id,
