@@ -244,13 +244,16 @@ def test_release_step_requests_routes_popped_states_to_the_pipeline_hook():
     runner.input_batch = None
     runner.pipeline = SimpleNamespace(release_step_request=received.append)
 
-    released = runner.release_step_requests(["req", "gone", "uncached"])
+    released = runner.release_step_requests(["req", "gone", "uncached", "req"])
 
     assert released == 2
-    # Order follows the pop of each cached state; ids without state (the
-    # already-released "gone") reach neither the hook nor the count.
+    # The caller's order survives the dedup (dict.fromkeys), and a duplicate
+    # id neither retires twice nor double-notifies the hook.
     assert received == [retired, uncached]
     assert runner.state_cache == {}
+    # A later cleanup of the same ids finds no state and stays silent.
+    assert runner.release_step_requests(["req", "uncached"]) == 0
+    assert received == [retired, uncached]
 
 
 def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit_summary: bool = True):

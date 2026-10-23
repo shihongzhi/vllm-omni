@@ -632,6 +632,9 @@ class TestResumablePrepare:
         pipeline.release_step_request = retired.append
 
         DiffusionModelRunner.execute_stepwise(runner, _new_output())
+        # Record the state the runner actually cached, so the hook assertion
+        # below checks identity with the real object, not a lookalike.
+        failed_state = runner.state_cache["req-1"]
         output = DiffusionModelRunner.execute_stepwise(runner, _cached_output())
 
         request_output = output.get_request_output("req-1")
@@ -642,7 +645,7 @@ class TestResumablePrepare:
         # The failed state must retire through the pipeline hook, not vanish
         # with a bare state_cache.pop, or its request-owned resources (the
         # SenseNova AR-decode ownership, denoise KV caches) leak.
-        assert [state.request_id for state in retired] == ["req-1"]
+        assert retired == [failed_state]
 
     def test_step_scheduler_failure_retires_through_the_hook(
         self,
@@ -654,9 +657,12 @@ class TestResumablePrepare:
         the shared retirement path (not a bare ``state_cache.pop``) is what
         frees the pipeline's per-request resources there.
         """
-        pipeline = _ResumablePipeline(prepare_steps=0, num_steps=2)
+        pipeline = _ResumablePipeline(prepare_steps=2, num_steps=2)
         runner = _make_runner(pipeline)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        DiffusionModelRunner.execute_stepwise(runner, _new_output())
+        failed_state = runner.state_cache["req-1"]
         retired = []
         pipeline.release_step_request = retired.append
 
@@ -665,10 +671,64 @@ class TestResumablePrepare:
             raise RuntimeError("euler update blew up")
 
         pipeline.step_scheduler = _raise
-        output = DiffusionModelRunner.execute_stepwise(runner, _new_output())
+        output = DiffusionModelRunner.execute_stepwise(runner, _cached_output())
 
         request_output = output.get_request_output("req-1")
         assert request_output.finished is True
         assert "euler update blew up" in request_output.result.error
         assert "req-1" not in runner.state_cache
-        assert [state.request_id for state in retired] == ["req-1"]
+        assert retired == [failed_state]
+
+    def test_step_scheduler_failure_spares_wave_peers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Retiring the failed request of a wave leaves its peers running.
+
+        Both requests are admitted in one wave and denoise together; only one
+        ``step_scheduler`` raises. The peer must finish its forward and stay
+        schedulable, and the failure's cleanup must not retire it.
+        """
+        pipeline = _ResumablePipeline(prepare_steps=1, num_steps=2)
+        runner = _make_runner(pipeline)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        retired = []
+        pipeline.release_step_request = retired.append
+
+        def _raise(state, noise_pred, **kwargs):
+            if state.request_id == "req-a":
+                raise RuntimeError("euler update blew up")
+            return _ResumablePipeline.step_scheduler(pipeline, state, noise_pred, **kwargs)
+
+        pipeline.step_scheduler = _raise
+        reqs = [
+            OmniDiffusionRequest(
+                prompt="a prompt",
+                request_id=request_id,
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+            )
+            for request_id in ("req-a", "req-b")
+        ]
+        output = DiffusionModelRunner.execute_stepwise(
+            runner,
+            DiffusionSchedulerOutput(
+                step_id=0,
+                scheduled_new_reqs=[NewRequestData(request_id=req.request_id, req=req) for req in reqs],
+                scheduled_cached_reqs=CachedRequestData.make_empty(),
+                finished_req_ids=set(),
+                num_running_reqs=2,
+                num_waiting_reqs=0,
+            ),
+        )
+
+        failed_output = output.get_request_output("req-a")
+        assert failed_output.finished is True
+        assert "euler update blew up" in failed_output.result.error
+        # The peer ran the same wave's (single, batched) denoise forward and
+        # keeps its state.
+        assert output.get_request_output("req-b").finished is False
+        assert pipeline.denoise_calls == 1
+        peer_state = runner.state_cache["req-b"]
+        assert peer_state.step_index == 1
+        # The failure's cleanup retired exactly the failed request.
+        assert [state.request_id for state in retired] == ["req-a"]
