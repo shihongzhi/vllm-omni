@@ -628,6 +628,8 @@ class TestResumablePrepare:
         pipeline = _ResumablePipeline(prepare_steps=3, fail_at=2)
         runner = _make_runner(pipeline)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        retired = []
+        pipeline.release_step_request = retired.append
 
         DiffusionModelRunner.execute_stepwise(runner, _new_output())
         output = DiffusionModelRunner.execute_stepwise(runner, _cached_output())
@@ -637,3 +639,36 @@ class TestResumablePrepare:
         assert "prepare step blew up" in request_output.result.error
         assert "req-1" not in runner.state_cache
         assert pipeline.denoise_calls == 0
+        # The failed state must retire through the pipeline hook, not vanish
+        # with a bare state_cache.pop, or its request-owned resources (the
+        # SenseNova AR-decode ownership, denoise KV caches) leak.
+        assert [state.request_id for state in retired] == ["req-1"]
+
+    def test_step_scheduler_failure_retires_through_the_hook(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A denoise-loop per-request failure reaches the retirement hook too.
+
+        ``step_scheduler`` raising pops the request out of the wave mid-loop;
+        the shared retirement path (not a bare ``state_cache.pop``) is what
+        frees the pipeline's per-request resources there.
+        """
+        pipeline = _ResumablePipeline(prepare_steps=0, num_steps=2)
+        runner = _make_runner(pipeline)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        retired = []
+        pipeline.release_step_request = retired.append
+
+        def _raise(state, noise_pred, **kwargs):
+            del state, noise_pred, kwargs
+            raise RuntimeError("euler update blew up")
+
+        pipeline.step_scheduler = _raise
+        output = DiffusionModelRunner.execute_stepwise(runner, _new_output())
+
+        request_output = output.get_request_output("req-1")
+        assert request_output.finished is True
+        assert "euler update blew up" in request_output.result.error
+        assert "req-1" not in runner.state_cache
+        assert [state.request_id for state in retired] == ["req-1"]

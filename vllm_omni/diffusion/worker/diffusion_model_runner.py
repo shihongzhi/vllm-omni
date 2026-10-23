@@ -1173,10 +1173,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         next wave. Native KV cleanup retains its generation/draining contract.
         Every popped state is also routed through the pipeline retirement hook
         (``pipeline.release_step_request``, #8859) so pipelines close
-        request-owned resources on finish, abort, and failure alike.
+        request-owned resources on finish, abort, and failure alike. The
+        caller's order is kept, so pipelines observe retirements in the order
+        the scheduler issued them.
         """
         release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
-        unique_request_ids = set(request_ids)
+        unique_request_ids = list(dict.fromkeys(request_ids))
         if not unique_request_ids:
             return 0
         released = 0
@@ -1188,7 +1190,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             if callable(release):
                 release(state)
         batch = self.input_batch
-        if batch is not None and not unique_request_ids.isdisjoint(batch.request_ids):
+        if batch is not None and not set(unique_request_ids).isdisjoint(batch.request_ids):
             self.input_batch = None
         return released
 
@@ -1349,7 +1351,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         stage: str,
     ) -> RunnerOutput:
         """Drop a request whose prepare phase failed on this or another DiT rank."""
-        self.state_cache.pop(state.request_id, None)
+        # Route through release_step_requests so the retirement hook fires for
+        # the concrete state; a bare state_cache.pop here would skip
+        # pipeline.release_step_request and leak its request-owned resources.
+        self.release_step_requests([state.request_id])
         if per_req_exc is None:
             per_req_exc = RuntimeError(f"Stepwise {stage} failed on another DiT rank for {state.request_id}")
         logger.error(
@@ -1728,7 +1733,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
-                            self.state_cache.pop(req.request_id, None)
+                            # Same retirement contract as the prepare-failure
+                            # path: the hook must see this state, so no bare pop.
+                            self.release_step_requests([req.request_id])
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,

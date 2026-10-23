@@ -226,6 +226,8 @@ def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
     assert not hasattr(runner, "graph_runners")
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_release_step_requests_routes_popped_states_to_the_pipeline_hook():
     """Every popped state reaches ``pipeline.release_step_request`` (#8859).
 
