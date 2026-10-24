@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import math
-from typing import Literal
+from typing import Literal, cast
 
 import torch
+from comfy.model_management import processing_interrupted, throw_exception_if_processing_interrupted
 from comfy_api.input import AudioInput, VideoInput
 
 from .utils.api_client import VLLMOmniClient
-from .utils.latent_mask import _align_frame_count, _video_latent_t
+from .utils.latent_mask import _align_frame_count
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
 from .utils.types import (
@@ -24,6 +26,7 @@ from .utils.types import (
     QwenTTSModelSpecificParams,
     VideoReferences,
     WanModelSpecificParams,
+    YuE2ModelSpecificParams,
 )
 from .utils.validators import (
     add_sampling_parameters_to_stage,
@@ -360,6 +363,54 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         return (output,)
 
 
+class VLLMOmniRestoreVideo(_VLLMOmniGenerateBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "url": ("STRING", {"default": "http://localhost:8098/v1"}),
+                "model": ("STRING", {"default": "seedvr2"}),
+                "width": ("INT", {"default": 224, "min": 16, "step": 16}),
+                "height": ("INT", {"default": 128, "min": 16, "step": 16}),
+                "seed": ("INT", {"default": 7723, "min": 0, "max": 0x7FFFFFFFFFFFFFFF}),
+                "timeout_seconds": ("INT", {"default": 1800, "min": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "restore"
+    DESCRIPTION = "Restore a whole clip on a remote SeedVR2 service, retaining source FPS, frame count and audio."
+
+    async def restore(
+        self, video: VideoInput, url: str, model: str, width: int, height: int, seed: int, timeout_seconds: int
+    ) -> tuple[VideoInput]:
+        if timeout_seconds <= 0:
+            raise ValueError("Restoration timeout must be positive.")
+        client = VLLMOmniClient(url.strip().rstrip("/"), timeout=timeout_seconds, max_poll_duration=timeout_seconds)
+        throw_exception_if_processing_interrupted()
+        node_task = cast(asyncio.Task[object], asyncio.current_task())
+
+        async def interrupt_when_stopped() -> None:
+            while not processing_interrupted():
+                await asyncio.sleep(0.1)
+            # Cancel once; the request's finally block owns bounded job cleanup.
+            node_task.cancel()
+
+        interrupt = asyncio.create_task(interrupt_when_stopped())
+        try:
+            output = await client.restore_video(model=model.strip(), video=video, width=width, height=height, seed=seed)
+            return (output,)
+        except asyncio.CancelledError:
+            # Preserve ComfyUI's interruption signal after the client cleans up.
+            throw_exception_if_processing_interrupted()
+            raise
+        finally:
+            interrupt.cancel()
+            await asyncio.gather(interrupt, return_exceptions=True)
+
+
 class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):
     @classmethod
     def INPUT_TYPES(cls):
@@ -537,10 +588,10 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
 
 
 class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
-    """Generate a song from lyrics and a musical description with MiniMax Music 3."""
+    """Generate music from lyrics and a style caption using a remote vLLM-Omni service."""
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[object, ...]]]:
         return {
             "required": {
                 "url": ("STRING", {"default": "http://localhost:8000/v1"}),
@@ -567,6 +618,7 @@ class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
                 "seed": ("INT", {"default": 0, "min": 0, "max": 2**53 - 1, "control_after_generate": True}),
                 "response_format": (["wav", "mp3", "flac", "opus"],),
             },
+            "optional": {"model_specific_params": ("MUSIC_PARAMS",)},
         }
 
     RETURN_TYPES = ("AUDIO",)
@@ -582,7 +634,11 @@ class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
         response_format: AudioFormat,
         max_duration_seconds: float,
         seed: int = 0,
+        model_specific_params: dict[str, str] | None = None,
     ) -> tuple[AudioInput]:
+        extra = {}
+        if model_specific_params is not None:
+            extra["extra_params"] = dict(model_specific_params)
         audio = await VLLMOmniClient(url.rstrip("/")).generate_speech(
             model=model,
             input=lyrics,
@@ -592,8 +648,43 @@ class VLLMOmniGenerateMusic(_VLLMOmniGenerateBase):
             response_format=response_format,
             max_new_tokens=int(max_duration_seconds * 25),
             seed=seed,
+            **extra,
         )
         return (audio,)
+
+
+class VLLMOmniYuE2Params:
+    """ABC conditioning for the YuE2 online music adapter."""
+
+    CATEGORY = "vLLM-Omni"
+    RETURN_TYPES = ("MUSIC_PARAMS",)
+    RETURN_NAMES = ("model_specific_params",)
+    FUNCTION = "get_params"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[object, ...]]]:
+        return {
+            "required": {
+                "cot": (["off", "melody", "full"],),
+                "abc": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "ABC score text, not a file path. Required for melody/full; empty for off.",
+                    },
+                ),
+            },
+        }
+
+    def get_params(self, cot: Literal["off", "melody", "full"], abc: str = "") -> tuple[YuE2ModelSpecificParams]:
+        if cot == "off":
+            if abc.strip():
+                raise ValueError("ABC requires cot=melody or full; clear ABC when cot=off.")
+            return (YuE2ModelSpecificParams(cot=cot),)
+        if not abc.strip():
+            raise ValueError("YuE2 melody/full requires supplied ABC score text; online ABC generation is unavailable.")
+        return (YuE2ModelSpecificParams(cot=cot, abc=abc),)
 
 
 class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
@@ -1133,13 +1224,13 @@ class VLLMOmniMiniMaxH3TemporalMask:
         else:
             raise ValueError(f"Unknown temporal mask mode: {mode}")
         available = min(frames, math.floor(boundary * 24 + 1e-8))
+        # Snap the preserved prefix to whole VAE clips (5 + 17n frames) so every
+        # latent it maps to is fully preserved.
         prefix = 0 if available < 5 else 5 + 17 * ((available - 5) // 17)
-        preserved = _video_latent_t(prefix) if prefix else 0
-        total = _video_latent_t(frames)
-        mask = torch.ones(total, 1, 1)
-        mask[:preserved] = 0
+        # One slice per output frame; the server pools frames to the latent grid.
+        mask = torch.ones(frames, 1, 1)
+        mask[:prefix] = 0
         indices = torch.arange(frames, device=images.device)
         source_indices = (indices * (source_fps / 24)).floor().long().clamp(max=images.shape[0] - 1)
         preview_images = images.index_select(0, source_indices)
-        preview_mask = mask.index_select(0, torch.arange(frames) * total // frames)
-        return mask, 24.0, preview_images, preview_mask
+        return mask, 24.0, preview_images, mask
