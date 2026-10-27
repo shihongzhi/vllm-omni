@@ -108,9 +108,9 @@ EXCLUDED_MODELS = [
     # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
-    "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
