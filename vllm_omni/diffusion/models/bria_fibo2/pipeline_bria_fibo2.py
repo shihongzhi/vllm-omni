@@ -40,7 +40,10 @@ from vllm_omni.diffusion.models.bria_fibo2.fibo2_transformer import (
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import (
+    DiffusionRequestBatch,
+    split_diffusion_output_by_request,
+)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -199,7 +202,7 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
     de-normalization.
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -378,48 +381,50 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         return self._unpatchify_latents(lat)
 
     # ------------------------------------------------------------------
-    # Forward: single-request T2I
+    # Forward: batched text-to-image, single-request edit
     # ------------------------------------------------------------------
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        if len(req.prompts) != 1:
-            raise ValueError("BriaFibo2Pipeline currently supports exactly one prompt per request")
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        raw_prompts = req.prompts
+        sps = req.sampling_params_list
 
-        raw_prompt = req.prompts[0]
-        prompt = raw_prompt if isinstance(raw_prompt, str) else (raw_prompt.get("prompt") or "")
+        # Any multi-modal image makes this an edit; edits stay at batch 1
+        # (context latents are per-request, cross-request RoPE packing is not
+        # modeled yet)
+        has_image = any(
+            not isinstance(p, str) and p.get("multi_modal_data", {}).get("image") is not None for p in raw_prompts
+        )
+        if has_image and req.num_reqs > 1:
+            raise ValueError("Fibo-2.0 edits currently run one request at a time")
 
-        # Images to edit (multi-modal input); without them this is a generation
-        edit_images: list[PIL.Image.Image] | None = None
-        if not isinstance(raw_prompt, str):
-            raw_image = raw_prompt.get("multi_modal_data", {}).get("image")
-            if raw_image is not None:
-                if not isinstance(raw_image, list):
-                    raw_image = [raw_image]
-                if not 1 <= len(raw_image) <= 5:
-                    raise ValueError(f"Fibo-2.0 edits between 1 and 5 images, got {len(raw_image)}.")
-                edit_images = [
-                    PIL.Image.open(im).convert("RGB") if isinstance(im, str) else im.convert("RGB") for im in raw_image
-                ]
-        sp = req.sampling_params
-        # Edit Turbo is distilled for 4 steps without CFG; default to its
-        # published usage when the caller leaves the knobs unset
+        # Shared shape/step/guidance fields are guaranteed identical across
+        # the batch by the engine's request-batch key; request-local values
+        # (seeds / generators / negative prompts) are read per request.
+        sp = sps[0]
         is_turbo = "turbo" in (self.od_config.model or "").lower()
         num_inference_steps = sp.num_inference_steps or (4 if is_turbo else 30)
         guidance_scale = sp.guidance_scale if sp.guidance_scale is not None else (1.0 if is_turbo else 5.0)
-        generator = sp.generator
-        seed = getattr(sp, "seed", None)
-        if generator is None and seed is not None:
-            generator = torch.Generator(device="cuda").manual_seed(seed)
         output_type = sp.output_type or "pil"
         device = self._execution_device
         dtype = self.transformer.dtype
         default_area = (self.default_sample_size * self.vae_scale_factor) ** 2
+        batch_size = req.num_reqs
 
-        # 1. Preprocess the images to edit: the crops the VAE encodes, and
-        # Qwen3-VL's downscaled copies. Editing defaults the result size to
-        # the trained size for the first image's aspect ratio.
+        # 1. Prompt assembly. Generation prompts are cleaned and batch-encoded
+        # (the processor pads to the longest, and the padding mask flows
+        # through the DiT). An edit prompt carries the vision markers.
         vae_images = text_encoder_images = None
         image_latents = None
-        if edit_images is not None:
+        if has_image:
+            raw_prompt = raw_prompts[0]
+            prompt_text = raw_prompt if isinstance(raw_prompt, str) else (raw_prompt.get("prompt") or "")
+            raw_image = raw_prompt.get("multi_modal_data", {}).get("image")
+            if not isinstance(raw_image, list):
+                raw_image = [raw_image]
+            if not 1 <= len(raw_image) <= 5:
+                raise ValueError(f"Fibo-2.0 edits between 1 and 5 images, got {len(raw_image)}.")
+            edit_images = [
+                PIL.Image.open(im).convert("RGB") if isinstance(im, str) else im.convert("RGB") for im in raw_image
+            ]
             height = sp.height
             width = sp.width
             if height is None and width is None:
@@ -428,7 +433,7 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 )
             height = height or self.default_sample_size * self.vae_scale_factor
             width = width or self.default_sample_size * self.vae_scale_factor
-            prompt = get_edit_prompt(prompt, len(edit_images))
+            prompts = [get_edit_prompt(prompt_text, len(edit_images))]
             vae_images, text_encoder_images = self.image_processor.preprocess(
                 edit_images,
                 height=height,
@@ -439,31 +444,47 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         else:
             height = sp.height or self.default_sample_size * self.vae_scale_factor
             width = sp.width or self.default_sample_size * self.vae_scale_factor
-            prompt = parse_prompt(prompt)
+            prompts = [parse_prompt(p if isinstance(p, str) else (p.get("prompt") or "")) for p in raw_prompts]
         if height % (self.vae_scale_factor * 2) or width % (self.vae_scale_factor * 2):
             raise ValueError(f"Height/width must be multiples of {self.vae_scale_factor * 2} (got {height}x{width}).")
 
-        # 2. Encode the caption (with the edit images for Qwen3-VL) and the
-        # fixed null caption (never with images)
+        # 2. Encode the captions (with the edit images for Qwen3-VL) and the
+        # negative captions (never with images). A user's negative prompt (an
+        # explicit empty string included) wins; only an absent one falls back
+        # to the trained null caption.
         do_cfg = guidance_scale > 1.0
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt, device, images=text_encoder_images)
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompts, device, images=text_encoder_images)
         if do_cfg:
-            # The user's negative prompt (an explicit empty string included)
-            # wins; only an absent one falls back to the trained null caption
-            negative_prompt = raw_prompt.get("negative_prompt") if not isinstance(raw_prompt, str) else None
-            if negative_prompt is None:
-                negative_prompt = DEFAULT_NEGATIVE_PROMPT
-            negative_embeds, negative_mask = self.encode_prompt(negative_prompt, device)
+            negative_prompts = []
+            for raw in raw_prompts:
+                negative_prompt = raw.get("negative_prompt") if not isinstance(raw, str) else None
+                negative_prompts.append(negative_prompt if negative_prompt is not None else DEFAULT_NEGATIVE_PROMPT)
+            negative_embeds, negative_mask = self.encode_prompt(negative_prompts, device)
         else:
             negative_embeds, negative_mask = None, None
 
-        # 3. Initial noise latents (fp32 for the whole trajectory) and the
-        # context latents of the images to edit
-        latents = self.prepare_latents(1, self.transformer.in_channels, height, width, device, generator)
+        # 3. Initial noise latents (fp32 for the whole trajectory), one row
+        # per request from its own generator, and the context latents of the
+        # images to edit
+        generators = []
+        for sp_i in sps:
+            generator = sp_i.generator
+            if generator is None:
+                seed = getattr(sp_i, "seed", None)
+                generator = torch.Generator(device="cuda")
+                if seed is not None:
+                    generator.manual_seed(seed)
+            generators.append(generator)
+        latents = randn_tensor(
+            (batch_size, self.transformer.in_channels, height // self.vae_scale_factor, width // self.vae_scale_factor),
+            generator=generators,
+            device=device,
+            dtype=torch.float32,
+        )
         if vae_images is not None:
             image_latents = self.prepare_image_latents(vae_images, latents.shape[0], device, dtype)
 
-        # 3. Timesteps: sigmas linspace(1, 1/steps) with the resolution shift
+        # 4. Timesteps: sigmas linspace(1, 1/steps) with the resolution shift
         patch_size = self.transformer.patch_size
         image_seq_len = (latents.shape[2] // patch_size) * (latents.shape[3] // patch_size)
         mu = calculate_shift(
@@ -478,8 +499,8 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             self.scheduler, num_inference_steps, device, sigmas=sigmas.tolist(), mu=mu
         )
 
-        # 4. Denoise: two independent CFG forwards per step (positive then
-        # null caption), merged as uncond + g * (cond - uncond). Inference
+        # 5. Denoise: two independent CFG forwards per step (positive then
+        # negative), merged as uncond + g * (cond - uncond). Inference
         # throughout: the DiT holds no grad graph (see the transformer port
         # notes) and the VAE decode must not build one either.
         with torch.no_grad(), self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -512,7 +533,7 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 latents = self.scheduler.step(guided, t, latents, return_dict=False)[0]
                 progress_bar.update()
 
-            # 5. Decode through the FLUX.2 VAE. The engine hands the output
+            # 6. Decode through the FLUX.2 VAE. The engine hands the output
             # tensor to the registry post_process_func, which owns the
             # tensor -> PIL conversion; decoding stops at the raw image.
             if output_type == "latent":
@@ -521,7 +542,8 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 lat = self._denormalize_bn(latents)
                 image = self.vae.decode(lat.to(self.vae.dtype), return_dict=False)[0]
 
-        return DiffusionOutput(output=image, stage_durations=getattr(self, "stage_durations", None))
+        result = DiffusionOutput(output=image, stage_durations=getattr(self, "stage_durations", None))
+        return split_diffusion_output_by_request(result, req, num_outputs_per_prompt=1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
