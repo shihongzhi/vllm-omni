@@ -61,10 +61,9 @@ def test_bria_fibo2_t2i(offline_client: OfflineOmniClient):
     import numpy as np
     from PIL import Image
 
-    ref = np.asarray(Image.open(baseline), dtype=np.float32)
     got = np.asarray(img, dtype=np.float32)
-    if got.shape != ref.shape:
-        pytest.skip(f"unexpected output shape {got.shape} vs baseline {ref.shape}")
+    assert got.shape == (1024, 1024, 3), f"unexpected output shape {got.shape}"
+    ref = np.asarray(Image.open(baseline), dtype=np.float32)
     af, bf = got.flatten(), ref.flatten()
     cos = float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-8))
     mse = float(np.mean((af / 255 - bf / 255) ** 2))
@@ -91,7 +90,8 @@ def test_bria_fibo2_edit(offline_client: OfflineOmniClient):
     if not (os.path.exists(edited) and os.path.exists(meta_path)):
         pytest.skip("edit baseline reference not available; e2e smoke only")
 
-    instruction = _json.load(open(meta_path))["stats"]["instruction"]
+    meta = _json.load(open(meta_path))
+    instruction = meta["stats"]["instruction"]
 
     sampling = OmniDiffusionSamplingParams(
         num_inference_steps=30,
@@ -114,10 +114,12 @@ def test_bria_fibo2_edit(offline_client: OfflineOmniClient):
     import numpy as np
     from PIL import Image
 
-    ref = np.asarray(Image.open(edited), dtype=np.float32)
     got = np.asarray(img, dtype=np.float32)
-    if got.shape != ref.shape:
-        pytest.skip(f"unexpected edit output shape {got.shape} vs baseline {ref.shape}")
+    assert got.ndim == 3 and got.shape[2] == 3, f"bad image shape {got.shape}"
+    assert got.shape[0] % 16 == 0 and got.shape[1] % 16 == 0, f"size not multiple of 16: {got.shape}"
+    exp_h, exp_w = meta["stats"]["height"], meta["stats"]["width"]
+    assert got.shape == (exp_h, exp_w, 3), f"unexpected edit output shape {got.shape}"
+    ref = np.asarray(Image.open(edited), dtype=np.float32)
     af, bf = got.flatten(), ref.flatten()
     cos = float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-8))
     mse = float(np.mean((af / 255 - bf / 255) ** 2))
@@ -145,7 +147,8 @@ def test_bria_fibo2_edit_turbo(offline_client: OfflineOmniClient):
     if not (os.path.exists(edited) and os.path.exists(meta_path)):
         pytest.skip("edit-turbo baseline reference not available; e2e smoke only")
 
-    instruction = _json.load(open(meta_path))["stats"]["instruction"]
+    meta = _json.load(open(meta_path))
+    instruction = meta["stats"]["instruction"]
 
     sampling = OmniDiffusionSamplingParams(
         num_inference_steps=4,
@@ -168,10 +171,12 @@ def test_bria_fibo2_edit_turbo(offline_client: OfflineOmniClient):
     import numpy as np
     from PIL import Image
 
-    ref = np.asarray(Image.open(edited), dtype=np.float32)
     got = np.asarray(img, dtype=np.float32)
-    if got.shape != ref.shape:
-        pytest.skip(f"unexpected turbo output shape {got.shape} vs baseline {ref.shape}")
+    assert got.ndim == 3 and got.shape[2] == 3, f"bad image shape {got.shape}"
+    assert got.shape[0] % 16 == 0 and got.shape[1] % 16 == 0, f"size not multiple of 16: {got.shape}"
+    exp_h, exp_w = meta["stats"]["height"], meta["stats"]["width"]
+    assert got.shape == (exp_h, exp_w, 3), f"unexpected turbo output shape {got.shape}"
+    ref = np.asarray(Image.open(edited), dtype=np.float32)
     af, bf = got.flatten(), ref.flatten()
     cos = float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-8))
     mse = float(np.mean((af / 255 - bf / 255) ** 2))

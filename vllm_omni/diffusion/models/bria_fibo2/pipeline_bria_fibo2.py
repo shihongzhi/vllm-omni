@@ -178,7 +178,12 @@ def get_post_process_func(od_config: OmniDiffusionConfig):
 
     image_processor = VaeImageProcessor(vae_scale_factor=16, do_convert_rgb=True)
 
-    def post_process_func(images: torch.Tensor):
+    def post_process_func(images: torch.Tensor, sampling_params=None):
+        # The engine probes the hook's signature and passes sampling_params
+        # when accepted. Latent output bypasses image conversion and flows
+        # through the engine's raw-tensor path.
+        if sampling_params is not None and getattr(sampling_params, "output_type", None) == "latent":
+            return images
         return image_processor.postprocess(images, output_type="pil")
 
     return post_process_func
@@ -389,13 +394,17 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             if raw_image is not None:
                 if not isinstance(raw_image, list):
                     raw_image = [raw_image]
+                if not 1 <= len(raw_image) <= 5:
+                    raise ValueError(f"Fibo-2.0 edits between 1 and 5 images, got {len(raw_image)}.")
                 edit_images = [
-                    PIL.Image.open(im).convert("RGB") if isinstance(im, str) else im.convert("RGB")
-                    for im in raw_image[:5]
+                    PIL.Image.open(im).convert("RGB") if isinstance(im, str) else im.convert("RGB") for im in raw_image
                 ]
         sp = req.sampling_params
-        num_inference_steps = sp.num_inference_steps or 30
-        guidance_scale = sp.guidance_scale if sp.guidance_scale is not None else 5.0
+        # Edit Turbo is distilled for 4 steps without CFG; default to its
+        # published usage when the caller leaves the knobs unset
+        is_turbo = "turbo" in (self.od_config.model or "").lower()
+        num_inference_steps = sp.num_inference_steps or (4 if is_turbo else 30)
+        guidance_scale = sp.guidance_scale if sp.guidance_scale is not None else (1.0 if is_turbo else 5.0)
         generator = sp.generator
         seed = getattr(sp, "seed", None)
         if generator is None and seed is not None:
@@ -438,7 +447,15 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         # fixed null caption (never with images)
         do_cfg = guidance_scale > 1.0
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt, device, images=text_encoder_images)
-        negative_embeds, negative_mask = self.encode_prompt(DEFAULT_NEGATIVE_PROMPT, device) if do_cfg else (None, None)
+        if do_cfg:
+            # The user's negative prompt (an explicit empty string included)
+            # wins; only an absent one falls back to the trained null caption
+            negative_prompt = raw_prompt.get("negative_prompt") if not isinstance(raw_prompt, str) else None
+            if negative_prompt is None:
+                negative_prompt = DEFAULT_NEGATIVE_PROMPT
+            negative_embeds, negative_mask = self.encode_prompt(negative_prompt, device)
+        else:
+            negative_embeds, negative_mask = None, None
 
         # 3. Initial noise latents (fp32 for the whole trajectory) and the
         # context latents of the images to edit
