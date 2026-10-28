@@ -41,29 +41,51 @@ FIBO2_REF_DATA = Path(os.environ.get("FIBO2_REF_DATA", "/root/autodl-fs/fibo-bas
 # Tolerances: the port runs end-to-end in bf16 (the deployment dtype), while
 # the diffusers baseline ran the same bf16 weights through PyTorch SDPA and
 # eager RMSNorm. Kernel reduction orders differ, so bitwise equality is not
-# expected; after 44 blocks the max deviation sits near bf16 noise (~1e-2
-# mean, ~1% of the output scale). A logic error anywhere (RoPE planes, bundle
-# indexing, modulation) collapses the cosine far below this bar, so the
-# cosine + relative-error pair is the correctness oracle; absolute atol is
-# reported for information.
+# expected. Across all six sampled points (steps 0/15/29 x cond/uncond) the
+# cosine sits at 0.99993 +- 0.000003 — a single noise signature — while the
+# max deviation is an extreme-value statistic that fluctuates between 0.03
+# and 0.13 absolute (0.67%-2.23% of each step's ~5-6 magnitude output scale)
+# as the trajectory deepens. A logic error (RoPE planes, bundle indexing,
+# modulation, masks) collapses the cosine far below this bar, so cosine is
+# the primary oracle; the relative bound is set above the observed spread
+# with margin.
 FORWARD_COS = 0.9995
-FORWARD_REL = 0.015
+FORWARD_REL = 0.025
+
+
+def _baseline_meta() -> dict:
+    return json.loads((FIBO2_REF_DATA / "run1" / "meta.json").read_text())
 
 
 def _snapshot_dir() -> Path:
-    root = FIBO2_HF_HOME / "hub" / "models--briaai--Fibo-2.0-dev" / "snapshots"
-    return next(iter(sorted(root.iterdir())))
-
-
-def _skip_if_unavailable():
-    if not (FIBO2_REF_DATA / "run1" / "tensors" / "first_step.safetensors").exists():
-        pytest.skip(f"reference data not found under {FIBO2_REF_DATA}")
-    if not FIBO2_HF_HOME.exists():
-        pytest.skip(f"HF cache not found under {FIBO2_HF_HOME}")
+    """The snapshot the baseline ran on, pinned by its meta.json model_sha."""
+    sha = _baseline_meta()["model_sha"]
+    snap = FIBO2_HF_HOME / "hub" / "models--briaai--Fibo-2.0-dev" / "snapshots" / sha
+    if not snap.exists():
+        pytest.skip(f"baseline revision {sha} not found under {FIBO2_HF_HOME}")
+    return snap
 
 
 @pytest.fixture(scope="module")
-def vllm_env():
+def resources():
+    """Availability gate: runs before any env/model setup, so absent
+    GPU/weights/reference data skip instead of erroring mid-fixture."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    tdir = FIBO2_REF_DATA / "run1" / "tensors"
+    for name in ("first_step.safetensors", "prompt_embeds.safetensors", "negative_prompt_embeds.safetensors"):
+        if not (tdir / name).exists():
+            pytest.skip(f"reference data {name} not found under {FIBO2_REF_DATA}")
+    if not (FIBO2_REF_DATA / "run1" / "meta.json").exists():
+        pytest.skip(f"baseline meta.json not found under {FIBO2_REF_DATA}")
+    snap_root = FIBO2_HF_HOME / "hub" / "models--briaai--Fibo-2.0-dev" / "snapshots"
+    if not snap_root.exists():
+        pytest.skip(f"HF cache not found under {FIBO2_HF_HOME}")
+    _snapshot_dir()  # skips unless the pinned revision is cached
+
+
+@pytest.fixture(scope="module")
+def vllm_env(resources):
     """Single-process distributed env so vLLM parallel layers initialize."""
     import vllm.distributed as dist
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
@@ -71,7 +93,11 @@ def vllm_env():
     with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cuda"))):
         dist.init_distributed_environment(world_size=1, rank=0, distributed_init_method="tcp://127.0.0.1:29611")
         dist.initialize_model_parallel(tensor_model_parallel_size=1)
-        yield
+        try:
+            yield
+        finally:
+            dist.destroy_model_parallel()
+            dist.destroy_distributed_environment()
 
 
 @pytest.fixture(scope="module")
@@ -85,9 +111,13 @@ def model(vllm_env):
     config.pop("_class_name", None)
     config.pop("_diffusers_version", None)
 
+    prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
-    model = Fibo2Transformer2DModel(**config)
-    model = model.to("cuda")
+    try:
+        model = Fibo2Transformer2DModel(**config)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+    model = model.to(torch.bfloat16).to("cuda")
 
     weights = []
     for shard in sorted((snap / "transformer").glob("diffusion_pytorch_model-*.safetensors")):
@@ -136,7 +166,6 @@ def _compare(name: str, out: torch.Tensor, ref: torch.Tensor, report: dict):
 
 @pytest.mark.parametrize("branch", ["cond", "uncond"])
 def test_first_step_parity(model, branch):
-    _skip_if_unavailable()
     first, pos, neg, timestep = _first_inputs()
     embeds = pos["prompt_embeds"] if branch == "cond" else neg["negative_prompt_embeds"]
     ref = first[f"noise_pred_{branch}"]
@@ -158,6 +187,130 @@ def test_first_step_parity(model, branch):
         f"{branch} forward mismatch: cosine={entry['cosine']:.6f} (min {FORWARD_COS}), "
         f"rel_err={entry['rel_err']:.4f} (max {FORWARD_REL}), max_abs_diff={entry['max_abs_diff']:.4g}"
     )
+
+
+@pytest.mark.parametrize("step", [15, 29])
+@pytest.mark.parametrize("branch", ["cond", "uncond"])
+def test_selected_steps_parity(model, step, branch):
+    """Mid-trajectory and near-end steps: parity at step 0 alone does not
+    prove the whole denoising interval matches. Reference data comes from
+    the baseline's selected_steps capture."""
+    tdir = FIBO2_REF_DATA / "run1" / "tensors"
+    sel_path = tdir / "selected_steps.safetensors"
+    if not sel_path.exists():
+        pytest.skip("selected_steps.safetensors not in reference data (regenerate baseline)")
+    sel = load_file(sel_path)
+    prefix = f"step_{step:03d}_"
+    keys = [k for k in sel if k.startswith(prefix)]
+    assert keys, f"step {step} missing from selected_steps reference"
+
+    if branch == "cond":
+        embeds = load_file(tdir / "prompt_embeds.safetensors")["prompt_embeds"]
+    else:
+        embeds = load_file(tdir / "negative_prompt_embeds.safetensors")["negative_prompt_embeds"]
+
+    with torch.no_grad():
+        out, _ = model(
+            hidden_states=sel[f"{prefix}latent_model_input"].to("cuda", torch.bfloat16),
+            timestep=sel[f"{prefix}timestep"].to("cuda", torch.float32),
+            encoder_hidden_states=embeds.to("cuda", torch.bfloat16),
+            encoder_attention_mask=None,
+            context_latents=None,
+        )
+
+    report: dict = {}
+    _compare(f"step{step}_{branch}", out, sel[f"{prefix}noise_pred_{branch}"], report)
+    print(json.dumps(report, indent=2))
+    entry = report[f"step{step}_{branch}"]
+    assert entry["pass"], (
+        f"step {step} {branch} mismatch: cosine={entry['cosine']:.6f} "
+        f"(min {FORWARD_COS}), rel_err={entry['rel_err']:.4f} (max {FORWARD_REL})"
+    )
+
+
+def test_masked_batch_consistency(model):
+    """The padding-mask path: a padded batch must reproduce each row's
+    unpadded forward. Row 0 is the baseline positive prompt (78 tokens);
+    row 1 pads the 46-token null caption to 78 and crosses a gist tier
+    (78 -> 256, 300 -> 320 gist tokens) via a synthetic long prompt.
+
+    The reference is each row run alone through the same model, so this
+    checks mask semantics (padding must not leak), not kernel parity.
+    """
+    tdir = FIBO2_REF_DATA / "run1" / "tensors"
+    pos = load_file(tdir / "prompt_embeds.safetensors")["prompt_embeds"]  # (1,6,78,7680)
+    neg = load_file(tdir / "negative_prompt_embeds.safetensors")["negative_prompt_embeds"]
+    torch.manual_seed(1234)
+    long_prompt = torch.randn(1, 6, 300, 7680).to(torch.bfloat16)
+
+    text_len = 78
+    neg_pad = torch.zeros(1, 6, text_len, 7680, dtype=torch.bfloat16)
+    neg_pad[:, :, : neg.shape[2]] = neg.to(torch.bfloat16)
+    mask = torch.zeros(2, text_len, dtype=torch.bool)
+    mask[0] = True
+    mask[1, : neg.shape[2]] = True
+
+    latents = load_file(tdir / "first_step.safetensors")["latent_model_input"].to("cuda", torch.bfloat16)
+    latents = latents.repeat(2, 1, 1, 1)
+    timestep = torch.full((2,), 1.0, dtype=torch.float32, device="cuda")
+
+    batch_embeds = torch.cat([pos.to("cuda", torch.bfloat16), neg_pad.to("cuda", torch.bfloat16)], dim=0)
+    with torch.no_grad():
+        out_batch, _ = model(latents, timestep, batch_embeds, encoder_attention_mask=mask.to("cuda"))
+
+    # Row 1 alone, unpadded (its own length) must match the batched row 1.
+    with torch.no_grad():
+        out_single, _ = model(
+            latents[1:2],
+            timestep[:1],
+            neg.to("cuda", torch.bfloat16),
+            encoder_attention_mask=None,
+        )
+    d = (out_batch[1:2].float() - out_single.float()).abs()
+    scale = out_single.float().abs().max().item()
+    cos = torch.nn.functional.cosine_similarity(
+        out_batch[1:2].flatten().float().cpu(), out_single.flatten().float().cpu(), dim=0
+    ).item()
+    print(
+        json.dumps(
+            {"padded_row_vs_single": {"max_abs_diff": d.max().item(), "cosine": cos, "rel": d.max().item() / scale}},
+            indent=2,
+        )
+    )
+    assert cos >= 0.999, f"padded row leaked into mask: cosine={cos:.6f}"
+    assert d.max().item() / scale <= 0.02, f"padding changed row output: rel={d.max().item() / scale:.4f}"
+
+    # Cross-tier batch: 78-token and 300-token prompts together exercise the
+    # gist-padding branch (gist 256 vs 320 -> image first, padded gist last).
+    pos_pad300 = torch.zeros(1, 6, 300, 7680, dtype=torch.bfloat16)
+    pos_pad300[:, :, :78] = pos.to(torch.bfloat16)
+    tier_embeds = torch.cat([pos_pad300, long_prompt], dim=0).to("cuda", torch.bfloat16)
+    tier_mask = torch.zeros(2, 300, dtype=torch.bool)
+    tier_mask[0, :78] = True
+    tier_mask[1] = True
+    with torch.no_grad():
+        out_tier, _ = model(latents, timestep, tier_embeds, encoder_attention_mask=tier_mask.to("cuda"))
+    with torch.no_grad():
+        out_tier_single, _ = model(
+            latents[0:1], timestep[:1], pos.to("cuda", torch.bfloat16), encoder_attention_mask=None
+        )
+    d0 = (out_tier[0:1].float() - out_tier_single.float()).abs()
+    cos0 = torch.nn.functional.cosine_similarity(
+        out_tier[0:1].flatten().float().cpu(), out_tier_single.flatten().float().cpu(), dim=0
+    ).item()
+    print(
+        json.dumps(
+            {
+                "gist_padded_row_vs_single": {
+                    "max_abs_diff": d0.max().item(),
+                    "cosine": cos0,
+                    "rel": d0.max().item() / out_tier_single.float().abs().max().item(),
+                }
+            },
+            indent=2,
+        )
+    )
+    assert cos0 >= 0.999, f"gist padding leaked: cosine={cos0:.6f}"
 
 
 def test_gist_count():

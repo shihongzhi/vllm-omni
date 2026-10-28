@@ -30,6 +30,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -89,6 +90,13 @@ def compute_gist_count(
         quantized = int(math.ceil(raw / gist_step)) * gist_step
         counts.append(max(min_gist, min(max_gist, quantized)))
     return counts
+
+
+def _kv_attn_metadata(attn_mask: torch.Tensor | None) -> AttentionMetadata | None:
+    """(B, kv_len) bool validity mask -> dense 4D SDPA mask, diffusers layout."""
+    if attn_mask is None:
+        return None
+    return AttentionMetadata(attn_mask=attn_mask[:, None, None, :])
 
 
 class TimestepEmbedder(nn.Module):
@@ -185,6 +193,7 @@ class Fibo2SelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
     ):
         qkv, _ = self.to_qkv(hidden_states)
         qkv = _restore_linear_output_shape(qkv, hidden_states)
@@ -203,7 +212,7 @@ class Fibo2SelfAttention(nn.Module):
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
 
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(query, key, value, _kv_attn_metadata(attn_mask))
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(dtype)
@@ -283,7 +292,12 @@ class Fibo2CrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
         )
 
-    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ):
         # These projections pass return_bias=False, so they return plain tensors.
         query = self.to_q(hidden_states)
         query = _restore_linear_output_shape(query, hidden_states)
@@ -302,7 +316,7 @@ class Fibo2CrossAttention(nn.Module):
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
 
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(query, key, value, _kv_attn_metadata(attn_mask))
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(dtype)
@@ -422,11 +436,13 @@ class Fibo2TransformerBlock(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor | None,
         sin: torch.Tensor | None,
+        attn_mask: torch.Tensor | None = None,
         adaln_input: torch.Tensor | None = None,
         noise_mask: torch.Tensor | None = None,
         adaln_noisy: torch.Tensor | None = None,
         adaln_clean: torch.Tensor | None = None,
         encoder_hidden_states: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         seq_len = x.shape[1]
 
@@ -456,12 +472,16 @@ class Fibo2TransformerBlock(nn.Module):
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
         # Attention block
-        attn_out = self.attention(self.attention_norm1(x) * scale_msa, cos=cos, sin=sin)
+        attn_out = self.attention(self.attention_norm1(x) * scale_msa, cos=cos, sin=sin, attn_mask=attn_mask)
         x = x + gate_msa * self.attention_norm2(attn_out)
 
         # Gated cross-attention to the text encoder (injection blocks only)
         if self.cross_attention is not None:
-            cross_out = self.cross_attention(self.cross_attn_norm1(x), encoder_hidden_states=encoder_hidden_states)
+            cross_out = self.cross_attention(
+                self.cross_attn_norm1(x),
+                encoder_hidden_states=encoder_hidden_states,
+                attn_mask=encoder_attention_mask,
+            )
             x = x + self.cross_attn_gate.tanh() * self.cross_attn_norm2(cross_out)
 
         # FFN block
@@ -509,11 +529,19 @@ class Fibo2PerceiverLayer(nn.Module):
             prefix=_join_prefix(prefix, "ffn"),
         )
 
-    def forward(self, latents: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        latents: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
+        gist_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         latents = latents + self.cross_attention(
-            self.cross_attn_norm(latents), encoder_hidden_states=encoder_hidden_states
+            self.cross_attn_norm(latents),
+            encoder_hidden_states=encoder_hidden_states,
+            attn_mask=encoder_attention_mask,
         )
-        latents = latents + self.self_attention(self.self_attn_norm(latents))
+        latents = latents + self.self_attention(self.self_attn_norm(latents), attn_mask=gist_mask)
         latents = latents + self.ffn(self.ffn_norm(latents))
         return latents
 
@@ -549,11 +577,17 @@ class Fibo2PerceiverResampler(nn.Module):
         )
         self.norm_out = RMSNorm(dim, eps=norm_eps)
 
-    def forward(self, encoder_hidden_states: torch.Tensor, num_gist_tokens: int) -> torch.Tensor:
+    def forward(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        num_gist_tokens: int,
+        encoder_attention_mask: torch.Tensor | None = None,
+        gist_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size = encoder_hidden_states.shape[0]
         latents = self.latent_queries[:num_gist_tokens].unsqueeze(0).expand(batch_size, -1, -1)
         for layer in self.layers:
-            latents = layer(latents, encoder_hidden_states)
+            latents = layer(latents, encoder_hidden_states, encoder_attention_mask, gist_mask)
         return self.norm_out(latents)
 
 
@@ -883,7 +917,12 @@ class Fibo2Transformer2DModel(CachedTransformer):
             max_text_len=self.gist_max_text_len,
         )
         num_gist_tokens = max(gist_counts)
-        gist = self.perceiver(encoder_hidden_states[:, 0], num_gist_tokens)
+        num_context_tokens = hidden_states.shape[1] - num_image_tokens
+        gist_mask = None
+        if min(gist_counts) < num_gist_tokens:
+            assert num_context_tokens == 0, "batch-padded gist with context images is not supported yet"
+            gist_mask = torch.arange(num_gist_tokens, device=device) < torch.tensor(gist_counts, device=device)[:, None]
+        gist = self.perceiver(encoder_hidden_states[:, 0], num_gist_tokens, encoder_attention_mask, gist_mask)
         gist_ids = self.create_coordinate_grid((num_gist_tokens, 1, 1), (1, 0, 0), device).flatten(0, 2)
 
         # 5. One stream: gist tokens first, then the image tokens, then the
@@ -892,29 +931,24 @@ class Fibo2Transformer2DModel(CachedTransformer):
         # every row as varlen attention backends expect. Positions come from
         # RoPE, so the order changes nothing but float rounding. The noise
         # mask marks which tokens are noisy
-        num_context_tokens = hidden_states.shape[1] - num_image_tokens
         gist_cos, gist_sin = self.rope_embedder(gist_ids)
         gist_cos = gist_cos.unsqueeze(0)
         gist_sin = gist_sin.unsqueeze(0)
-        gist_mask = None
-        if min(gist_counts) < num_gist_tokens:
-            assert num_context_tokens == 0, "batch-padded gist with context images is not supported yet"
-            gist_mask = torch.arange(num_gist_tokens, device=device) < torch.tensor(gist_counts, device=device)[:, None]
         if gist_mask is None:
             image_start = num_gist_tokens
             hidden_states = torch.cat([gist, hidden_states], dim=1)
             cos = torch.cat([gist_cos, image_cos], dim=1)
             sin = torch.cat([gist_sin, image_sin], dim=1)
+            attention_mask = None
         else:
             image_start = 0
             hidden_states = torch.cat([hidden_states, gist], dim=1)
             cos = torch.cat([image_cos, gist_cos], dim=1)
             sin = torch.cat([image_sin, gist_sin], dim=1)
-            # NOTE: batched prompts with padded gist tokens additionally need
-            # a bool attention mask (image+context tokens True, real gist
-            # tokens True, padded gist False); wiring it through the diffusion
-            # Attention layer is deferred until batched serving lands.
-            # attention_mask = torch.cat([image_mask, gist_mask], dim=1)
+            # Padded batch: image+context tokens are all real, gist rows carry
+            # the per-prompt validity mask
+            image_mask = torch.ones(batch_size, num_image_tokens + num_context_tokens, dtype=torch.bool, device=device)
+            attention_mask = torch.cat([image_mask, gist_mask], dim=1)
         noise_mask = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=device)
         noise_mask[:, image_start : image_start + num_image_tokens] = 1
 
@@ -929,18 +963,18 @@ class Fibo2Transformer2DModel(CachedTransformer):
                 hidden_states,
                 cos,
                 sin,
+                attn_mask=attention_mask,
                 noise_mask=noise_mask,
                 adaln_noisy=adaln_noisy,
                 adaln_clean=adaln_clean,
                 encoder_hidden_states=text,
+                encoder_attention_mask=encoder_attention_mask,
             )
 
         # 7. Final layer on the image tokens only, then unpatchify to latents
-        hidden_states = self.final_layer(hidden_states[:, image_start : image_start + num_image_tokens], c=adaln_noisy)
-        hidden_states = _restore_linear_output_shape(
-            hidden_states,
-            hidden_states,
-        )
+        image_tokens = hidden_states[:, image_start : image_start + num_image_tokens]
+        hidden_states = self.final_layer(image_tokens, c=adaln_noisy)
+        hidden_states = _restore_linear_output_shape(hidden_states, image_tokens)
         batch_frames = hidden_states.view(batch_size, height_tokens, width_tokens, channels, patch_size, patch_size)
         output = batch_frames.permute(0, 3, 1, 4, 2, 5).reshape(batch_size, channels, height, width)
         return output, {}
