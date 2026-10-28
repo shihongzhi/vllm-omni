@@ -72,3 +72,57 @@ def test_bria_fibo2_t2i(offline_client: OfflineOmniClient):
     # 30 denoising steps of bf16 kernel noise vs the diffusers baseline land
     # around cosine 0.998 / 29 dB; a broken component collapses far below.
     assert cos >= 0.99, f"e2e image diverged from baseline: cosine={cos:.4f}"
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
+def test_bria_fibo2_edit(offline_client: OfflineOmniClient):
+    """Edit path: instruction + image to edit (the baseline T2I capture),
+    compared against the diffusers edit baseline (FIBO2_EDIT_REF)."""
+    import json as _json
+
+    edit_ref = os.environ.get("FIBO2_EDIT_REF", "/root/autodl-fs/fibo-baseline/ref-data/edit1")
+    source = os.path.join(os.environ.get("FIBO2_REF_DATA", "/root/autodl-fs/fibo-baseline/ref-data/run1"), "image.png")
+    edited = os.path.join(edit_ref, "edited_image.png")
+    meta_path = os.path.join(edit_ref, "meta.json")
+    if not (os.path.exists(edited) and os.path.exists(meta_path)):
+        pytest.skip("edit baseline reference not available; e2e smoke only")
+
+    instruction = _json.load(open(meta_path))["stats"]["instruction"]
+
+    sampling = OmniDiffusionSamplingParams(
+        num_inference_steps=30,
+        guidance_scale=5.0,
+        seed=42,
+    )
+    request_config = {
+        "model": MODEL,
+        "prompt": instruction,
+        "images": [source],
+        "sampling_params": sampling,
+    }
+    resp = offline_client.send_diffusion_request(request_config)
+    assert resp.success, f"edit request failed: {getattr(resp, 'error_message', None)}"
+    assert resp.images, f"no images in edit response: text={resp.text_content}"
+    img = resp.images[0]
+
+    import math
+
+    import numpy as np
+    from PIL import Image
+
+    ref = np.asarray(Image.open(edited), dtype=np.float32)
+    got = np.asarray(img, dtype=np.float32)
+    if got.shape != ref.shape:
+        pytest.skip(f"unexpected edit output shape {got.shape} vs baseline {ref.shape}")
+    af, bf = got.flatten(), ref.flatten()
+    cos = float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-8))
+    mse = float(np.mean((af / 255 - bf / 255) ** 2))
+    psnr = 10 * math.log10(1.0 / mse) if mse > 0 else 99.0
+    print(f"edit e2e vs baseline: cosine={cos:.4f} psnr={psnr:.2f}dB")
+    # The edit path transcribes most tokens from the context image, so it
+    # tracks the baseline much tighter than generation (pipeline-level smoke
+    # lands at cosine 0.99995 / 49 dB).
+    assert cos >= 0.995, f"e2e edit diverged from baseline: cosine={cos:.4f}"

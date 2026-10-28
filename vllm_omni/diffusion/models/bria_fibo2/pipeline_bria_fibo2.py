@@ -13,11 +13,11 @@ import inspect
 import json
 import os
 from collections.abc import Iterable
-from typing import Any, ClassVar
+from typing import ClassVar
 
+import PIL.Image
 import torch
 import torch.nn as nn
-from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
@@ -31,6 +31,9 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_flux2 import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
+from vllm_omni.diffusion.models.bria_fibo2.fibo2_image_processor import (
+    Fibo2ImageProcessor,
+)
 from vllm_omni.diffusion.models.bria_fibo2.fibo2_transformer import (
     Fibo2Transformer2DModel,
 )
@@ -61,26 +64,84 @@ TEXT_ENCODER_OUT_LAYERS = ((9, 20, 31), (5, 16, 27), (7, 18, 29), (9, 20, 31), (
 _DROP_CAPTION_KEYS = ("aesthetic_score", "preference_score")
 
 
-def parse_prompt(prompt: str) -> str:
-    """Clean a structured JSON caption the way Fibo 2.0 was trained with:
-    drop empty values and score keys, serialize compactly. Non-JSON prompts
-    pass through unchanged."""
+# Where an image stands in a Qwen3-VL prompt
+VISION_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
+
+# Training captions hold no empty values (None, "", {}, [] or NaN) and no
+# aesthetic_score / preference_score keys; the short_description +
+# text_render pair keeps its empty list (it says the image has no text).
+_SCORE_KEYS = ("aesthetic_score", "preference_score")
+
+
+def _parse_prompt(prompt: str) -> tuple[dict | str | None, str | None]:
+    """A prompt's caption, in the form Fibo 2.0 was trained with, and its edit
+    instruction. A non-JSON prompt comes back as it is, with no instruction."""
+    import math as _math
+
     try:
         caption = json.loads(prompt)
     except json.JSONDecodeError:
-        return prompt
+        return prompt, None
     if not isinstance(caption, dict):
-        return prompt
+        return prompt, None
+    instruction = caption.pop("edit_instruction", None)
+    if "structured_caption" in caption:
+        caption = caption.pop("structured_caption")
+        if not isinstance(caption, dict):
+            return caption or None, instruction
 
-    def clean(value: Any) -> Any:
+    def empty(value):
+        if isinstance(value, float):
+            return _math.isnan(value)
+        return value is None or (isinstance(value, (str, dict, list)) and not value)
+
+    def clean(value):
         if isinstance(value, dict):
-            return {k: clean(v) for k, v in value.items() if k not in _DROP_CAPTION_KEYS and clean(v) != ""}
+            value = {k: clean(v) for k, v in value.items()}
+            return {k: v for k, v in value.items() if not empty(v)}
         if isinstance(value, list):
-            return [clean(v) for v in value if clean(v) != ""]
+            return [v for v in map(clean, value) if not empty(v)]
         return value
 
-    caption = {k: v for k, v in clean(caption).items() if v != ""}
-    return json.dumps(caption, separators=(",", ":"), ensure_ascii=False)
+    keys = set(caption)
+    caption = {
+        key: {k: v for k, v in value.items() if k not in _SCORE_KEYS} if isinstance(value, dict) else value
+        for key, value in clean(caption).items()
+        if key not in _SCORE_KEYS
+    }
+    caption = {key: value for key, value in caption.items() if value != {}}
+    if keys == {"short_description", "text_render"}:
+        caption = {
+            "short_description": caption.get("short_description") or "",
+            "text_render": caption.get("text_render") or [],
+        }
+    return caption or None, instruction
+
+
+def parse_prompt(prompt: str) -> str:
+    """A generation caption in its trained form, serialized compactly. A
+    prompt that isn't a JSON caption stays as it is."""
+    caption, _ = _parse_prompt(prompt)
+    if isinstance(caption, str):
+        return prompt
+    return json.dumps(caption or {}, separators=(",", ":"), ensure_ascii=False)
+
+
+def get_edit_prompt(prompt: str, num_images: int) -> str:
+    """An edit prompt as Fibo 2.0 was trained on: a JSON object with a vision
+    marker per image, the caption of the result when the prompt has one, then
+    the edit instruction."""
+    caption, instruction = _parse_prompt(prompt)
+    if instruction is None:
+        caption, instruction = None, prompt
+    if num_images == 1:
+        edit = {"image": VISION_MARKER}
+    else:
+        edit = {f"image_{k}": VISION_MARKER for k in range(1, num_images + 1)}
+    if caption:
+        edit["structured_caption"] = caption
+    edit["edit_instruction"] = instruction
+    return json.dumps(edit, separators=(",", ":"), ensure_ascii=False)
 
 
 def calculate_shift(
@@ -113,6 +174,8 @@ def retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=None, **kw
 
 
 def get_post_process_func(od_config: OmniDiffusionConfig):
+    from diffusers.image_processor import VaeImageProcessor
+
     image_processor = VaeImageProcessor(vae_scale_factor=16, do_convert_rgb=True)
 
     def post_process_func(images: torch.Tensor):
@@ -196,7 +259,8 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         self.tokenizer_max_length = 4096
         self.vae_scale_factor = 8
         self.default_sample_size = 128
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
+        self.text_encoder_image_size = 768
+        self.image_processor = Fibo2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -206,12 +270,17 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
     # Prompt encoding: port of diffusers' _get_qwen_prompt_embeds
     # ------------------------------------------------------------------
     def _encode_prompt_bundle(
-        self, prompt: str | list[str], device: torch.device, max_sequence_length: int
+        self,
+        prompt: str | list[str],
+        device: torch.device,
+        max_sequence_length: int,
+        images: list[PIL.Image.Image] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         prompt = [prompt] if isinstance(prompt, str) else prompt
         text = [PROMPT_TEMPLATE.format(p) for p in prompt]
         text_inputs = self.processor(
             text=text,
+            images=images,
             padding="longest",
             max_length=max_sequence_length,
             truncation=True,
@@ -244,9 +313,10 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         prompt: str | list[str],
         device: torch.device | None = None,
         num_images_per_prompt: int = 1,
+        images: list[PIL.Image.Image] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         device = device or self._execution_device
-        embeds, mask = self._encode_prompt_bundle(prompt, device, self.tokenizer_max_length)
+        embeds, mask = self._encode_prompt_bundle(prompt, device, self.tokenizer_max_length, images=images)
         embeds = embeds.to(device).repeat_interleave(num_images_per_prompt, dim=0)
         if mask is not None:
             mask = mask.to(device).repeat_interleave(num_images_per_prompt, dim=0)
@@ -260,6 +330,24 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
         latents = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)
         return latents
+
+    def prepare_image_latents(
+        self, images: list[torch.Tensor], batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> list[torch.Tensor]:
+        """VAE-encode the images to edit and normalize with the VAE's
+        BatchNorm statistics, like the image being generated. The pixels are
+        made contiguous so the VAE's convolutions run the same kernels as the
+        reference implementation."""
+        image_latents = []
+        for img in images:
+            img = img.contiguous().to(device=device, dtype=self.vae.dtype)
+            latents = self._patchify_latents(self.vae.encode(img).latent_dist.mode().float())
+            bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+            bn_scale = (1 / torch.sqrt(self.vae.bn.running_var + self.vae.config.batch_norm_eps)).view(1, -1, 1, 1)
+            latents = (latents - bn_mean) * bn_scale.to(latents.device, latents.dtype)
+            latents = self._unpatchify_latents(latents)
+            image_latents.append(latents.repeat(batch_size, 1, 1, 1).to(dtype))
+        return image_latents
 
     def _patchify_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """VAE-side 2x2 regrouping: (B, C, H, W) -> (B, 4C, H/2, W/2).
@@ -293,11 +381,19 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         raw_prompt = req.prompts[0]
         prompt = raw_prompt if isinstance(raw_prompt, str) else (raw_prompt.get("prompt") or "")
-        prompt = parse_prompt(prompt)
 
+        # Images to edit (multi-modal input); without them this is a generation
+        edit_images: list[PIL.Image.Image] | None = None
+        if not isinstance(raw_prompt, str):
+            raw_image = raw_prompt.get("multi_modal_data", {}).get("image")
+            if raw_image is not None:
+                if not isinstance(raw_image, list):
+                    raw_image = [raw_image]
+                edit_images = [
+                    PIL.Image.open(im).convert("RGB") if isinstance(im, str) else im.convert("RGB")
+                    for im in raw_image[:5]
+                ]
         sp = req.sampling_params
-        height = sp.height or 1024
-        width = sp.width or 1024
         num_inference_steps = sp.num_inference_steps or 30
         guidance_scale = sp.guidance_scale if sp.guidance_scale is not None else 5.0
         generator = sp.generator
@@ -305,19 +401,49 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         if generator is None and seed is not None:
             generator = torch.Generator(device="cuda").manual_seed(seed)
         output_type = sp.output_type or "pil"
+        device = self._execution_device
+        dtype = self.transformer.dtype
+        default_area = (self.default_sample_size * self.vae_scale_factor) ** 2
 
+        # 1. Preprocess the images to edit: the crops the VAE encodes, and
+        # Qwen3-VL's downscaled copies. Editing defaults the result size to
+        # the trained size for the first image's aspect ratio.
+        vae_images = text_encoder_images = None
+        image_latents = None
+        if edit_images is not None:
+            height = sp.height
+            width = sp.width
+            if height is None and width is None:
+                width, height = self.image_processor.get_image_size(
+                    edit_images[0].width / edit_images[0].height, area=default_area
+                )
+            height = height or self.default_sample_size * self.vae_scale_factor
+            width = width or self.default_sample_size * self.vae_scale_factor
+            prompt = get_edit_prompt(prompt, len(edit_images))
+            vae_images, text_encoder_images = self.image_processor.preprocess(
+                edit_images,
+                height=height,
+                width=width,
+                area=default_area,
+                text_encoder_image_size=self.text_encoder_image_size,
+            )
+        else:
+            height = sp.height or self.default_sample_size * self.vae_scale_factor
+            width = sp.width or self.default_sample_size * self.vae_scale_factor
+            prompt = parse_prompt(prompt)
         if height % (self.vae_scale_factor * 2) or width % (self.vae_scale_factor * 2):
             raise ValueError(f"Height/width must be multiples of {self.vae_scale_factor * 2} (got {height}x{width}).")
 
-        device = self._execution_device
-        dtype = self.transformer.dtype
-
-        # 1. Encode the caption and the fixed null caption
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt, device)
+        # 2. Encode the caption (with the edit images for Qwen3-VL) and the
+        # fixed null caption (never with images)
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt, device, images=text_encoder_images)
         negative_embeds, negative_mask = self.encode_prompt(DEFAULT_NEGATIVE_PROMPT, device)
 
-        # 2. Initial noise latents (fp32 for the whole trajectory)
+        # 3. Initial noise latents (fp32 for the whole trajectory) and the
+        # context latents of the images to edit
         latents = self.prepare_latents(1, self.transformer.in_channels, height, width, device, generator)
+        if vae_images is not None:
+            image_latents = self.prepare_image_latents(vae_images, latents.shape[0], device, dtype)
 
         # 3. Timesteps: sigmas linspace(1, 1/steps) with the resolution shift
         patch_size = self.transformer.patch_size
@@ -347,14 +473,14 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                     timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
                     encoder_attention_mask=prompt_embeds_mask,
-                    context_latents=None,
+                    context_latents=image_latents,
                 )[0].float()
                 noise_pred_uncond = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
                     encoder_hidden_states=negative_embeds,
                     encoder_attention_mask=negative_mask,
-                    context_latents=None,
+                    context_latents=image_latents,
                 )[0].float()
                 guided = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                 latents = self.scheduler.step(guided, t, latents, return_dict=False)[0]
