@@ -45,21 +45,21 @@ def test_bria_fibo2_t2i(offline_client: OfflineOmniClient):
         "prompt": CAPTION,
         "sampling_params": sampling,
     }
-    outputs = offline_client.send_diffusion_request(request_config)
-    assert outputs, "no outputs returned"
-    images = outputs[0].outputs if hasattr(outputs[0], "outputs") else outputs[0]
-    assert images is not None and len(images) > 0
+    # OfflineOmniClient.send_diffusion_request returns a single response
+    resp = offline_client.send_diffusion_request(request_config)
+    assert resp.success, f"request failed: {getattr(resp, 'error_message', None)}"
+    assert resp.images, f"no images in response: text={resp.text_content}"
+    img = resp.images[0]
 
     baseline = os.path.join(REF_DATA, "image.png")
     if not os.path.exists(baseline):
         pytest.skip("baseline reference image not available; e2e smoke only")
 
+    import math
+
     import numpy as np
     from PIL import Image
 
-    img = images[0] if not hasattr(images[0], "image") else images[0].image
-    if not isinstance(img, Image.Image):  # some clients return ndarray paths
-        img = Image.open(img) if isinstance(img, str) else Image.fromarray(img)
     ref = np.asarray(Image.open(baseline), dtype=np.float32)
     got = np.asarray(img, dtype=np.float32)
     if got.shape != ref.shape:
@@ -67,8 +67,6 @@ def test_bria_fibo2_t2i(offline_client: OfflineOmniClient):
     af, bf = got.flatten(), ref.flatten()
     cos = float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-8))
     mse = float(np.mean((af / 255 - bf / 255) ** 2))
-    import math
-
     psnr = 10 * math.log10(1.0 / mse) if mse > 0 else 99.0
     print(f"e2e vs baseline: cosine={cos:.4f} psnr={psnr:.2f}dB")
     # 30 denoising steps of bf16 kernel noise vs the diffusers baseline land

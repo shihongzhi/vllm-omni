@@ -360,13 +360,14 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 latents = self.scheduler.step(guided, t, latents, return_dict=False)[0]
                 progress_bar.update()
 
-            # 5. Decode through the FLUX.2 VAE
+            # 5. Decode through the FLUX.2 VAE. The engine hands the output
+            # tensor to the registry post_process_func, which owns the
+            # tensor -> PIL conversion; decoding stops at the raw image.
             if output_type == "latent":
                 image = latents
             else:
                 lat = self._denormalize_bn(latents)
                 image = self.vae.decode(lat.to(self.vae.dtype), return_dict=False)[0]
-                image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(output=image, stage_durations=getattr(self, "stage_durations", None))
 
