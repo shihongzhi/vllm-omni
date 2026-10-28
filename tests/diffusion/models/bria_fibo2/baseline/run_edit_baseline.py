@@ -9,7 +9,8 @@ edit 分支（Phase A）并保存全部中间量；官方 pipe 同输入重跑�
 """
 
 # ruff: noqa
-# ^ Snapshot of the edit-baseline generator; runs in the external diffusers
+# ^ Snapshot of the edit-baseline generator (works for Dev and Edit Turbo
+#   via --model/--steps/--guidance); runs in the external diffusers
 #   environment, not under this repo's lint policy.
 
 import argparse
@@ -46,8 +47,8 @@ def sync():
     torch.cuda.synchronize()
 
 
-def load_pipeline():
-    pipe = BriaFibo2Pipeline.from_pretrained("briaai/Fibo-2.0-dev", dtype=torch.bfloat16).to("cuda")
+def load_pipeline(model_id):
+    pipe = BriaFibo2Pipeline.from_pretrained(model_id, dtype=torch.bfloat16).to("cuda")
     pipe.set_progress_bar_config(disable=True)
     return pipe
 
@@ -95,7 +96,10 @@ def capture_run(pipe, args):
     prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(EDIT_INSTRUCTION, text_encoder_images, device, 1)
     sync()
     stats["encode_cond_s"] = time.perf_counter() - t0
-    neg_embeds, neg_embeds_mask = pipe.encode_prompt(DEFAULT_NEGATIVE_PROMPT, None, device, 1)
+    if args.guidance > 1.0:
+        neg_embeds, neg_embeds_mask = pipe.encode_prompt(DEFAULT_NEGATIVE_PROMPT, None, device, 1)
+    else:
+        neg_embeds, neg_embeds_mask = None, None
 
     # 4. 初始 noise（fp32）+ context latents（BN 归一化）
     gen = torch.Generator(device="cuda").manual_seed(args.seed)
@@ -134,29 +138,37 @@ def capture_run(pipe, args):
             context_latents=image_latents,
             return_dict=False,
         )[0].float()
-        noise_pred_uncond = pipe.transformer(
-            hidden_states=latent_model_input,
-            timestep=timestep,
-            encoder_hidden_states=neg_embeds,
-            encoder_attention_mask=neg_embeds_mask,
-            context_latents=image_latents,
-            return_dict=False,
-        )[0].float()
+        noise_pred_uncond = None
+        if args.guidance > 1.0:  # Edit Turbo (guidance 1.0) runs a single pass
+            noise_pred_uncond = pipe.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=neg_embeds,
+                encoder_attention_mask=neg_embeds_mask,
+                context_latents=image_latents,
+                return_dict=False,
+            )[0].float()
         if i in capture_at:
-            captured_steps[i] = {
+            step_capture = {
                 "latent_model_input": latent_model_input.clone(),
                 "timestep": timestep.clone(),
                 "noise_pred_cond": noise_pred.clone(),
-                "noise_pred_uncond": noise_pred_uncond.clone(),
             }
-        guided = noise_pred_uncond + args.guidance * (noise_pred - noise_pred_uncond)
+            if noise_pred_uncond is not None:
+                step_capture["noise_pred_uncond"] = noise_pred_uncond.clone()
+            captured_steps[i] = step_capture
+        if noise_pred_uncond is not None:
+            guided = noise_pred_uncond + args.guidance * (noise_pred - noise_pred_uncond)
+        else:
+            guided = noise_pred
         if i == 0:
             first = {
                 "noise_pred_cond": noise_pred.clone(),
-                "noise_pred_uncond": noise_pred_uncond.clone(),
                 "noise_pred_guided": guided.clone(),
                 "latent_model_input": latent_model_input.clone(),
             }
+            if noise_pred_uncond is not None:
+                first["noise_pred_uncond"] = noise_pred_uncond.clone()
         latents = pipe.scheduler.step(guided, t, latents, return_dict=False)[0]
         sync()
         step_times.append(time.perf_counter() - t0)
@@ -210,10 +222,11 @@ def save_artifacts(cap, official, out_dir, args):
     save_file(
         {"prompt_embeds": cap["prompt_embeds"].contiguous()}, os.path.join(tensors_dir, "prompt_embeds.safetensors")
     )
-    save_file(
-        {"negative_prompt_embeds": cap["neg_embeds"].contiguous()},
-        os.path.join(tensors_dir, "negative_prompt_embeds.safetensors"),
-    )
+    if cap["neg_embeds"] is not None:
+        save_file(
+            {"negative_prompt_embeds": cap["neg_embeds"].contiguous()},
+            os.path.join(tensors_dir, "negative_prompt_embeds.safetensors"),
+        )
     save_file(
         {"image_latents": cap["image_latents"].contiguous()}, os.path.join(tensors_dir, "image_latents.safetensors")
     )
@@ -257,6 +270,7 @@ def save_artifacts(cap, official, out_dir, args):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--model", default="briaai/Fibo-2.0-dev")
     p.add_argument("--out", default="/root/autodl-fs/fibo-baseline/ref-data/edit1")
     p.add_argument("--mode", choices=["capture", "verify"], default="capture")
     p.add_argument("--steps", type=int, default=30)
@@ -266,7 +280,7 @@ def main():
 
     if args.mode == "verify":
         ref_dir = args.out
-        pipe = load_pipeline()
+        pipe = load_pipeline(args.model)
         with torch.no_grad():
             cap = capture_run(pipe, args)
         report = {}
@@ -280,6 +294,8 @@ def main():
             "trajectory",
             "final_latents",
         ):
+            if not os.path.exists(os.path.join(ref_dir, "tensors", f"{fn}.safetensors")):
+                continue
             ref = load_file(os.path.join(ref_dir, "tensors", f"{fn}.safetensors"))
             now = {
                 "initial_latents": {"initial_latents": cap["initial_latents"]},
@@ -303,7 +319,7 @@ def main():
         print(f"ALL_PASS={all_pass}")
         raise SystemExit(0 if all_pass else 1)
 
-    pipe = load_pipeline()
+    pipe = load_pipeline(args.model)
     with torch.no_grad():  # 官方 __call__ 自带 @torch.no_grad()；手工复刻同样必须，否则 autograd 图 OOM
         cap = capture_run(pipe, args)
         official = official_run(pipe, cap, args)

@@ -103,3 +103,19 @@ python run_baseline.py --mode verify    # independent rerun, expects ALL_PASS
 `env.sh` in the original workspace pins `HF_HOME`/`HF_ENDPOINT` (hf-mirror)
 and the gated-repo token; the script needs `transformers>=5.20.1`,
 `diffusers==0.42.0`, and a CUDA GPU.
+
+## Edit Turbo baseline (ref-data/edit-turbo1)
+
+`briaai/Fibo-2.0-edit-turbo` (revision `b8dd54e5`) is the same
+`BriaFibo2Pipeline` architecture, distilled for editing: 4 steps,
+guidance 1.0 — no classifier-free guidance, one forward per step, the
+negative prompt has no effect. Generated with the same script:
+
+```bash
+python run_edit_baseline.py --model briaai/Fibo-2.0-edit-turbo \
+  --steps 4 --guidance 1.0 --out ref-data/edit-turbo1
+```
+
+Bitwise reproducible (ALL_PASS; manual-vs-official bitwise equal).
+vLLM-Omni parity: pipeline smoke cosine 0.9997 / 36.1 dB, engine e2e
+cosine 0.9999 / 43.9 dB.

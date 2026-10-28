@@ -436,8 +436,9 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         # 2. Encode the caption (with the edit images for Qwen3-VL) and the
         # fixed null caption (never with images)
+        do_cfg = guidance_scale > 1.0
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt, device, images=text_encoder_images)
-        negative_embeds, negative_mask = self.encode_prompt(DEFAULT_NEGATIVE_PROMPT, device)
+        negative_embeds, negative_mask = self.encode_prompt(DEFAULT_NEGATIVE_PROMPT, device) if do_cfg else (None, None)
 
         # 3. Initial noise latents (fp32 for the whole trajectory) and the
         # context latents of the images to edit
@@ -475,14 +476,22 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                     encoder_attention_mask=prompt_embeds_mask,
                     context_latents=image_latents,
                 )[0].float()
-                noise_pred_uncond = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=negative_embeds,
-                    encoder_attention_mask=negative_mask,
-                    context_latents=image_latents,
-                )[0].float()
-                guided = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                if do_cfg:
+                    # The negative pass runs separately, as in the reference
+                    # implementation: batching it with the prompt would pad
+                    # both to the longer of the two
+                    noise_pred_uncond = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep,
+                        encoder_hidden_states=negative_embeds,
+                        encoder_attention_mask=negative_mask,
+                        context_latents=image_latents,
+                    )[0].float()
+                    guided = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    # guidance_scale <= 1.0 (Edit Turbo: 4 steps, guidance 1.0)
+                    # runs a single pass; the negative prompt has no effect
+                    guided = noise_pred_cond
                 latents = self.scheduler.step(guided, t, latents, return_dict=False)[0]
                 progress_bar.update()
 
