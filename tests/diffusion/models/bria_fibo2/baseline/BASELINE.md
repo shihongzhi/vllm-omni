@@ -106,7 +106,9 @@ and the gated-repo token; the script needs `transformers>=5.20.1`,
 
 ## Edit Turbo baseline (ref-data/edit-turbo1)
 
-`briaai/Fibo-2.0-edit-turbo` (revision `b8dd54e5`) is the same
+`briaai/Fibo-2.0-edit-turbo` (revision `9a24ee68`; note Bria force-pushed
+new weights after the initial `b8dd54e5` download, so pin what you
+compare against) is the same
 `BriaFibo2Pipeline` architecture, distilled for editing: 4 steps,
 guidance 1.0 — no classifier-free guidance, one forward per step, the
 negative prompt has no effect. Generated with the same script:
@@ -117,5 +119,5 @@ python run_edit_baseline.py --model briaai/Fibo-2.0-edit-turbo \
 ```
 
 Bitwise reproducible (ALL_PASS; manual-vs-official bitwise equal).
-vLLM-Omni parity: pipeline smoke cosine 0.9997 / 36.1 dB, engine e2e
-cosine 0.9999 / 43.9 dB.
+vLLM-Omni parity on `9a24ee68`: engine e2e cosine 0.9998 / 39.7 dB
+(earlier `b8dd54e5` weights measured 36.1 dB smoke / 43.9 dB e2e).
