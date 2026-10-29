@@ -33,6 +33,12 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
@@ -90,6 +96,20 @@ def compute_gist_count(
         quantized = int(math.ceil(raw / gist_step)) * gist_step
         counts.append(max(min_gist, min(max_gist, quantized)))
     return counts
+
+
+def _packed_qk_norm_rope_table(
+    cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype, batch_size: int | None = None
+) -> torch.Tensor | None:
+    """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
+    Fibo's positions are batch-independent, so cos/sin stay batch-1 and the
+    real batch must be passed explicitly. ``None`` below the token threshold
+    or outside the CUDA-matching contract (BF16, D=128) keeps the eager
+    norm+rope chain."""
+    num_batch = batch_size if batch_size is not None else cos.shape[0]
+    if num_batch * cos.shape[1] < fused_qk_norm_rope_min_tokens(0):
+        return None
+    return pack_qk_norm_rope_table(cos[0], sin[0], num_batch, dtype=dtype, cuda_rms_norm=True)
 
 
 def _kv_attn_metadata(attn_mask: torch.Tensor | None) -> AttentionMetadata | None:
@@ -194,6 +214,7 @@ class Fibo2SelfAttention(nn.Module):
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ):
         qkv, _ = self.to_qkv(hidden_states)
         qkv = _restore_linear_output_shape(qkv, hidden_states)
@@ -204,10 +225,35 @@ class Fibo2SelfAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-        if cos is not None and sin is not None:
-            query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+        # The fused op reproduces the CUDA RMSNorm reduction of norm_q/norm_k
+        # plus the interleaved rotation; eager mode is bit-identical to the
+        # explicit chain below (same contract as Z-Image).
+        if (
+            qk_norm_rope_table is not None
+            and cos is not None
+            and sin is not None
+            and self.norm_q.weight.dtype == self.norm_k.weight.dtype == query.dtype
+            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        ):
+            batch_size, seq_len, num_heads, head_dim = query.shape
+            num_kv_heads = key.shape[2]
+            query, key = fused_qk_norm_rope(
+                query.reshape(batch_size * seq_len, num_heads, head_dim),
+                key.reshape(batch_size * seq_len, num_kv_heads, head_dim),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.norm_q.variance_epsilon,
+                interleaved=True,
+                cuda_rms_norm=True,
+            )
+            query = query.view(batch_size, seq_len, num_heads, head_dim)
+            key = key.view(batch_size, seq_len, num_kv_heads, head_dim)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+            if cos is not None and sin is not None:
+                query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
 
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -437,6 +483,7 @@ class Fibo2TransformerBlock(nn.Module):
         cos: torch.Tensor | None,
         sin: torch.Tensor | None,
         attn_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
         adaln_input: torch.Tensor | None = None,
         noise_mask: torch.Tensor | None = None,
         adaln_noisy: torch.Tensor | None = None,
@@ -472,7 +519,13 @@ class Fibo2TransformerBlock(nn.Module):
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
         # Attention block
-        attn_out = self.attention(self.attention_norm1(x) * scale_msa, cos=cos, sin=sin, attn_mask=attn_mask)
+        attn_out = self.attention(
+            self.attention_norm1(x) * scale_msa,
+            cos=cos,
+            sin=sin,
+            attn_mask=attn_mask,
+            qk_norm_rope_table=qk_norm_rope_table,
+        )
         x = x + gate_msa * self.attention_norm2(attn_out)
 
         # Gated cross-attention to the text encoder (injection blocks only)
@@ -891,11 +944,17 @@ class Fibo2Transformer2DModel(CachedTransformer):
         if context_latents:
             refiner_noise_mask = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=device)
             refiner_noise_mask[:, :num_image_tokens] = 1
+        refiner_qk_norm_rope_table = (
+            _packed_qk_norm_rope_table(image_cos, image_sin, hidden_states.dtype, batch_size)
+            if image_cos is not None
+            else None
+        )
         for block in self.noise_refiner:
             hidden_states = block(
                 hidden_states,
                 image_cos,
                 image_sin,
+                qk_norm_rope_table=refiner_qk_norm_rope_table,
                 adaln_input=adaln_noisy,
                 noise_mask=refiner_noise_mask,
                 adaln_noisy=adaln_noisy,
@@ -949,6 +1008,7 @@ class Fibo2Transformer2DModel(CachedTransformer):
             # the per-prompt validity mask
             image_mask = torch.ones(batch_size, num_image_tokens + num_context_tokens, dtype=torch.bool, device=device)
             attention_mask = torch.cat([image_mask, gist_mask], dim=1)
+        unified_qk_norm_rope_table = _packed_qk_norm_rope_table(cos, sin, hidden_states.dtype, batch_size)
         noise_mask = torch.zeros(batch_size, hidden_states.shape[1], dtype=torch.long, device=device)
         noise_mask[:, image_start : image_start + num_image_tokens] = 1
 
@@ -964,6 +1024,7 @@ class Fibo2Transformer2DModel(CachedTransformer):
                 cos,
                 sin,
                 attn_mask=attention_mask,
+                qk_norm_rope_table=unified_qk_norm_rope_table,
                 noise_mask=noise_mask,
                 adaln_noisy=adaln_noisy,
                 adaln_clean=adaln_clean,
