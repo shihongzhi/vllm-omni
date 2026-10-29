@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Fibo-2.0 Dev diffusers baseline: fixed-input generation + reference capture.
 
 Phase A replays the T2I path of BriaFibo2Pipeline.__call__ step by step;
@@ -53,7 +56,7 @@ def sha256_file(path):
 
 
 def sync():
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
 
 def load_pipeline(model_id):
@@ -135,7 +138,7 @@ def capture_run(pipe, args):
     captured_steps: dict[int, dict] = {}
     first = {}
     trajectory = {}
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     step_times = []
     for i, t in enumerate(timesteps):
         t0 = time.perf_counter()
@@ -178,17 +181,16 @@ def capture_run(pipe, args):
         trajectory[f"latents_step_{i:03d}"] = latents.clone()
     stats["per_step_s"] = step_times
     stats["loop_s"] = float(sum(step_times))
-    stats["peak_mem_loop_gb"] = torch.cuda.max_memory_allocated() / 2**30
+    stats["peak_mem_loop_gb"] = torch.accelerator.max_memory_allocated() / 2**30
     final_latents = latents.clone()
 
     # 7. VAE decode
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     t0 = time.perf_counter()
     image = vae_decode(pipe, final_latents)
     sync()
     stats["vae_decode_s"] = time.perf_counter() - t0
-    stats["peak_mem_decode_gb"] = torch.cuda.max_memory_allocated() / 2**30
-
+    stats["peak_mem_decode_gb"] = torch.accelerator.max_memory_allocated() / 2**30
     return {
         "prompt": prompt,
         "prompt_embeds": prompt_embeds,
@@ -306,7 +308,7 @@ def save_artifacts(cap, official_latents, out_dir, pipe, args, load_s):
             "numpy": np.__version__,
             "pillow": PIL.__version__,
             "gpu_driver": driver,
-            "gpu": torch.cuda.get_device_name(0),
+            "gpu": getattr(torch.cuda, "get_device_name")(0),  # snapshot runs in the external diffusers env,
         },
         "tensor_shapes": {
             "prompt_embeds": list(cap["prompt_embeds"].shape),
@@ -441,7 +443,7 @@ def main():
     # (~54 GB) and the first forward OOMs
     with torch.no_grad():
         cap = capture_run(pipe, args)
-    cap["stats"]["peak_after_load_gb"] = torch.cuda.max_memory_allocated() / 2**30
+    cap["stats"]["peak_after_load_gb"] = torch.accelerator.max_memory_allocated() / 2**30
     with torch.no_grad():
         official = official_run(pipe, cap, args)
     out_dir = os.path.join(args.out, "run1")

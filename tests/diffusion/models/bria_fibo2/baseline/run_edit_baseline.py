@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Fibo-2.0 Dev edit-path baseline: fixed-input generation (reference data).
 
 Editing = instruction + image to edit (context-latents conditioning). Phase A
@@ -45,7 +48,7 @@ def sha256_file(path):
 
 
 def sync():
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
 
 def load_pipeline(model_id):
@@ -259,7 +262,7 @@ def save_artifacts(cap, official, out_dir, args):
         "diffusers": diffusers.__version__,
         "transformers": transformers.__version__,
         "torch": torch.__version__,
-        "gpu": torch.cuda.get_device_name(0),
+        "gpu": getattr(torch.cuda, "get_device_name")(0),  # snapshot runs in the external diffusers env,
     }
     for fn in sorted(os.listdir(tensors_dir)):
         meta.setdefault("artifacts_sha256", {})[fn] = sha256_file(os.path.join(tensors_dir, fn))
