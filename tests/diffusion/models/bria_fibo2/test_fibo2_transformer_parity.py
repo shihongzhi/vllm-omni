@@ -325,3 +325,67 @@ def test_gist_count():
     assert compute_gist_count([2048], 256, 512, 64, 256, 2048) == [512]
     # Mid-range maps linearly, rounded up to a gist_step multiple.
     assert compute_gist_count([1024], 256, 512, 64, 256, 2048) == [384]
+
+
+@pytest.mark.parametrize("batch_kind", ["distinct", "mixed_len"])
+def test_pipeline_batch_row_correspondence(model, vllm_env, batch_kind):
+    """Pipeline-level batching oracle (no engine): rows in a batch must
+    correspond to their own prompt/seed. `distinct` batches two different
+    captions and seeds; `mixed_len` pads a short caption against the long
+    baseline one, exercising the text padding mask. Each row is compared
+    against the same request run alone through the same model.
+    """
+    import torch as _torch
+
+    tdir = FIBO2_REF_DATA / "run1" / "tensors"
+    pos = load_file(tdir / "prompt_embeds.safetensors")["prompt_embeds"]
+    latents = load_file(tdir / "first_step.safetensors")["latent_model_input"].to("cuda", torch.bfloat16)
+    timestep = torch.full((1,), 1.0, dtype=torch.float32, device="cuda")
+
+    torch.manual_seed(11)
+    if batch_kind == "distinct":
+        # Two different-length captions as the encoder would hand them over:
+        # the short row padded to the longest, with a validity mask
+        padded = torch.zeros(1, 6, 78, 7680, dtype=torch.bfloat16)
+        padded[:, :, :46] = _torch.randn(1, 6, 46, 7680).to(torch.bfloat16)
+        other = padded
+        masks = torch.ones(2, 78, dtype=torch.bool)
+        masks[1, 46:] = False
+    else:
+        other = torch.zeros(1, 6, 120, 7680, dtype=torch.bfloat16)
+        other[:, :, :78] = pos  # short real prefix, long padding tail
+        masks = torch.ones(2, 120, dtype=torch.bool)
+        masks[0, :78] = True
+        masks[0, 78:] = False
+        masks[1] = True
+        pos = torch.cat([pos, torch.zeros(1, 6, 42, 7680, dtype=torch.bfloat16)], dim=2)
+
+    batch_embeds = torch.cat([pos.to("cuda"), other.to("cuda")], dim=0)
+
+    with torch.no_grad():
+        batch_out, _ = model(
+            latents.repeat(2, 1, 1, 1),
+            torch.full((2,), 1.0, dtype=torch.float32, device="cuda"),
+            batch_embeds,
+            encoder_attention_mask=masks.to("cuda") if masks is not None else None,
+        )
+        row0_single, _ = model(
+            latents,
+            timestep,
+            pos.to("cuda"),
+            encoder_attention_mask=(masks[0:1].to("cuda") if masks is not None else None),
+        )
+        row1_single, _ = model(
+            latents,
+            timestep,
+            other.to("cuda"),
+            encoder_attention_mask=(masks[1:2].to("cuda") if masks is not None else None),
+        )
+
+    for row, single, name in ((0, row0_single, "row0"), (1, row1_single, "row1")):
+        a = batch_out[row : row + 1].float().cpu().flatten()
+        b = single.float().cpu().flatten()
+        cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+        max_abs = (batch_out[row : row + 1].float() - single.float()).abs().max().item()
+        print(json.dumps({f"{name}_vs_single": {"cosine": cos, "max_abs_diff": max_abs}}))
+        assert cos >= 0.999, f"{name} drifted from its single run: cosine={cos:.4f}"

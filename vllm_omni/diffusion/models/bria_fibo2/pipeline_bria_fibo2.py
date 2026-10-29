@@ -176,6 +176,32 @@ def retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=None, **kw
     return timesteps, num_inference_steps
 
 
+def get_bria_fibo2_pre_process_func(od_config: OmniDiffusionConfig):
+    """Set each request's batch_compatibility_key before scheduling.
+
+    Text-to-image requests share one bucket and batch freely. An edit
+    request (multi-modal image input) must run alone: the context latents
+    are per-request and cross-request RoPE packing is not modeled, so each
+    edit gets a key unique to itself — the scheduler then never merges two
+    edits, nor an edit with a T2I request, and the pipeline-level guard in
+    forward() stays as a backstop.
+    """
+
+    def pre_process_func(request):
+        prompt = request.prompt
+        has_image = (
+            not isinstance(prompt, str)
+            and (prompt.get("multi_modal_data") or {}).get("image") is not None
+        )
+        if has_image:
+            request.batch_compatibility_key = ("bria_fibo2", "edit", request.request_id)
+        else:
+            request.batch_compatibility_key = ("bria_fibo2", "t2i")
+        return request
+
+    return pre_process_func
+
+
 def get_post_process_func(od_config: OmniDiffusionConfig):
     from diffusers.image_processor import VaeImageProcessor
 
@@ -402,8 +428,18 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         sp = sps[0]
         is_turbo = "turbo" in (self.od_config.model or "").lower()
         num_inference_steps = sp.num_inference_steps or (4 if is_turbo else 30)
-        guidance_scale = sp.guidance_scale if sp.guidance_scale is not None else (1.0 if is_turbo else 5.0)
+        # The engine coerces an unset guidance_scale to 1.0 in the request
+        # layer, so `is not None` cannot tell "caller set it" apart; only a
+        # provided value is honored, otherwise the model default applies
+        # (Dev: 5.0 with CFG, Edit Turbo: 1.0 single-pass)
+        guidance_provided = bool(getattr(sp, "guidance_scale_provided", False))
+        guidance_scale = sp.guidance_scale if guidance_provided else (1.0 if is_turbo else 5.0)
         output_type = sp.output_type or "pil"
+        if sp.num_outputs_per_prompt and sp.num_outputs_per_prompt > 1:
+            raise ValueError(
+                "BriaFibo2Pipeline does not support num_outputs_per_prompt > 1 yet "
+                f"(got {sp.num_outputs_per_prompt}); duplicate the request instead."
+            )
         device = self._execution_device
         dtype = self.transformer.dtype
         default_area = (self.default_sample_size * self.vae_scale_factor) ** 2

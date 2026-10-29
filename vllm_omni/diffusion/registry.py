@@ -798,6 +798,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
+    "BriaFibo2Pipeline": "get_bria_fibo2_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
