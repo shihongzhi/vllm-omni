@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""Fibo-2.0 Dev Edit 路径基线：固定输入/输出生成（对照数据）。
+"""Fibo-2.0 Dev edit-path baseline: fixed-input generation (reference data).
 
-编辑 = instruction + 待编辑图（context latents 条件）。手工复刻 __call__ 的
-edit 分支（Phase A）并保存全部中间量；官方 pipe 同输入重跑（Phase B）比对。
+Editing = instruction + image to edit (context-latents conditioning). Phase A
+replays the __call__ edit branch and saves all intermediates; Phase B re-runs
+the official pipe on the same inputs and compares.
 
-用法: python run_edit_baseline.py            # capture（保存 ref-data/edit1）
-      python run_edit_baseline.py --verify   # 独立进程重跑比对
+Usage: python run_edit_baseline.py            # capture (saves ref-data/edit1)
+       python run_edit_baseline.py --verify   # independent re-run comparison
 """
 
 # ruff: noqa
@@ -32,7 +33,7 @@ from diffusers.pipelines.bria_fibo2.pipeline_bria_fibo2 import (
 from safetensors.torch import load_file, save_file
 
 EDIT_INSTRUCTION = "Make the background a snowy forest"
-SOURCE_IMAGE = "/root/autodl-fs/fibo-baseline/ref-data/run1/image.png"  # 基线 T2I 生成的红色自行车
+SOURCE_IMAGE = "/root/autodl-fs/fibo-baseline/ref-data/run1/image.png"  # the baseline T2I red-bicycle capture
 
 
 def sha256_file(path):
@@ -75,7 +76,7 @@ def capture_run(pipe, args):
 
     image = [Image.open(SOURCE_IMAGE).convert("RGB")]
 
-    # 2. 预处理：VAE 裁剪版 + Qwen3-VL 版
+    # 2. Preprocess: the VAE crops + the Qwen3-VL copies
     default_area = (pipe.default_sample_size * pipe.vae_scale_factor) ** 2
     width, height = pipe.image_processor.get_image_size(image[0].width / image[0].height, area=default_area)
     stats["height"], stats["width"] = height, width
@@ -87,9 +88,9 @@ def capture_run(pipe, args):
         text_encoder_image_size=pipe.text_encoder_image_size,
     )
 
-    # 3. 编码：edit prompt（带图）+ null caption（无图）
-    # diffusers 的 encode_prompt 内部会再做一次 _get_edit_prompt 组装，所以
-    # 这里传原始 instruction；组装结果单独保存供 vllm 侧对齐
+    # 3. Encode: the edit prompt (with images) + the null caption (without).
+    # diffusers' encode_prompt re-assembles via _get_edit_prompt internally, so
+    # pass the raw instruction here; the assembled form is saved for the vLLM side
     edit_prompt = pipe._get_edit_prompt(EDIT_INSTRUCTION, len(image))
     stats["edit_prompt"] = edit_prompt
     t0 = time.perf_counter()
@@ -101,7 +102,7 @@ def capture_run(pipe, args):
     else:
         neg_embeds, neg_embeds_mask = None, None
 
-    # 4. 初始 noise（fp32）+ context latents（BN 归一化）
+    # 4. Initial noise (fp32) + context latents (BN-normalized)
     gen = torch.Generator(device="cuda").manual_seed(args.seed)
     latents = pipe.prepare_latents(1, pipe.transformer.config.in_channels, height, width, device, gen)
     initial_latents = latents.clone()
@@ -122,7 +123,7 @@ def capture_run(pipe, args):
     stats["timesteps"] = timesteps.tolist()
     stats["mu"] = float(mu)
 
-    # 6. 去噪循环（两次独立前向，均带 context_latents）
+    # 6. Denoise loop (two independent forwards, both with context_latents)
     capture_at = sorted(set([0] + [s for s in (args.steps // 2, args.steps - 1) if 0 < s < args.steps]))
     first, captured_steps, trajectory = {}, {}, {}
     step_times = []
@@ -320,7 +321,7 @@ def main():
         raise SystemExit(0 if all_pass else 1)
 
     pipe = load_pipeline(args.model)
-    with torch.no_grad():  # 官方 __call__ 自带 @torch.no_grad()；手工复刻同样必须，否则 autograd 图 OOM
+    with torch.no_grad():  # the official __call__ is no-grad; the replay must match or the autograd graph OOMs
         cap = capture_run(pipe, args)
         official = official_run(pipe, cap, args)
     meta = save_artifacts(cap, official, args.out, args)

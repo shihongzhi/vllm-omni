@@ -1,14 +1,15 @@
 #!/usr/bin/env python
-"""Fibo-2.0 Dev Diffusers 基线：固定输入生成 + 对照数据捕获。
+"""Fibo-2.0 Dev diffusers baseline: fixed-input generation + reference capture.
 
-对照 BriaFibo2Pipeline.__call__ 的 T2I 路径手工复刻一遍（Phase A），
-再用官方 pipe.__call__ 以相同的 prompt_embeds/latents 重跑（Phase B），
-verify 模式下作为独立进程再跑一遍 capture 并逐项比对（Phase C），
-证明「同一份初始 latents 重复生成一致结果」。
+Phase A replays the T2I path of BriaFibo2Pipeline.__call__ step by step;
+Phase B re-runs the official pipe.__call__ on the same prompt_embeds/latents;
+Phase C (verify mode) repeats the capture in an independent process and
+compares every tensor, proving the same initial latents reproduce identical
+results.
 
-用法:
-  python run_baseline.py --mode capture   # 首次运行，保存全部对照数据到 <out>/run1
-  python run_baseline.py --mode verify    # 独立进程重跑，与 <out>/run1 逐项比对
+Usage:
+  python run_baseline.py --mode capture   # first run; saves all reference data to <out>/run1
+  python run_baseline.py --mode verify    # independent re-run, compares against <out>/run1
 """
 
 # ruff: noqa
@@ -33,7 +34,7 @@ from diffusers.pipelines.bria_fibo2.pipeline_bria_fibo2 import (
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
-# 固定输入：diffusers 文档示例 caption（bria_fibo2 pipeline docstring），无 text_render
+# Fixed input: the diffusers docstring caption (bria_fibo2 pipeline), no text_render
 CAPTION = {
     "short_description": "A red bicycle leaning against a white brick wall on a sunny morning.",
     "objects": [{"description": "a red city bicycle with a wicker basket", "location": "center"}],
@@ -58,7 +59,7 @@ def sync():
 def load_pipeline(model_id):
     try:
         pipe = BriaFibo2Pipeline.from_pretrained(model_id, dtype=torch.bfloat16)
-    except TypeError:  # 兼容旧的 torch_dtype 参数名
+    except TypeError:  # older diffusers spell the kwarg torch_dtype
         pipe = BriaFibo2Pipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     pipe = pipe.to("cuda")
     pipe.set_progress_bar_config(disable=True)
@@ -73,7 +74,7 @@ def build_prompt():
 
 
 def vae_decode(pipe, latents):
-    """复刻 __call__ 第 7 步：反 BatchNorm 归一化后 VAE 解码。"""
+    """Replays __call__ step 7: BatchNorm de-normalization, then VAE decode."""
     lat = pipe._patchify_latents(latents)
     bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(lat.device, lat.dtype)
     bn_scale = (1 / torch.sqrt(pipe.vae.bn.running_var + pipe.vae.config.batch_norm_eps)).view(1, -1, 1, 1)
@@ -84,7 +85,7 @@ def vae_decode(pipe, latents):
 
 
 def capture_run(pipe, args):
-    """Phase A：逐行复刻 __call__ 的 T2I 去噪路径，收集全部中间量。"""
+    """Phase A: replay the __call__ T2I denoising path, collecting all intermediates."""
     device = pipe._execution_device
     stats = {
         "steps": args.steps,
@@ -94,7 +95,7 @@ def capture_run(pipe, args):
         "width": args.width,
     }
 
-    # 3. 文本编码（正/负）。负 prompt 用 Fibo 训练用的固定 null caption
+    # 3. Text encoding (positive/negative). The negative uses Fibo's trained null caption
     _, prompt = build_prompt()
     t0 = time.perf_counter()
     prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(prompt, None, device, 1)
@@ -105,12 +106,12 @@ def capture_run(pipe, args):
     sync()
     stats["encode_neg_s"] = time.perf_counter() - t0
 
-    # 4. 初始 noise latents（fp32，cuda 生成器 seed=42）
+    # 4. Initial noise latents (fp32, cuda generator seed=42)
     gen = torch.Generator(device="cuda").manual_seed(args.seed)
     latents = pipe.prepare_latents(1, pipe.transformer.config.in_channels, args.height, args.width, device, gen)
     initial_latents = latents.clone()
 
-    # 5. timesteps：sigmas 1 -> 1/steps，按 1024 分辨率 image_seq_len 做 shift
+    # 5. Timesteps: sigmas 1 -> 1/steps, shifted by the 1024-class image_seq_len
     patch_size = pipe.transformer.config.patch_size
     image_seq_len = (latents.shape[2] // patch_size) * (latents.shape[3] // patch_size)
     mu = calculate_shift(
@@ -127,8 +128,9 @@ def capture_run(pipe, args):
     stats["mu"] = float(mu)
     stats["image_seq_len"] = int(image_seq_len)
 
-    # 6. 去噪循环：cond / uncond 两次独立前向 + CFG 合并 + scheduler.step
-    # 额外采样中间/尾步（0 为既有 first_step；15/29 供 vllm parity 复查整段去噪区间）
+    # 6. Denoise: two independent cond/uncond forwards + CFG merge + scheduler.step.
+    # Also sample mid/late steps (0 is the existing first_step; 15/29 let the
+    # vLLM parity oracle re-check the whole denoising interval)
     capture_at = sorted(set([0] + [s for s in (args.steps // 2, args.steps - 1) if 0 < s < args.steps]))
     captured_steps: dict[int, dict] = {}
     first = {}
@@ -179,7 +181,7 @@ def capture_run(pipe, args):
     stats["peak_mem_loop_gb"] = torch.cuda.max_memory_allocated() / 2**30
     final_latents = latents.clone()
 
-    # 7. VAE 解码
+    # 7. VAE decode
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     image = vae_decode(pipe, final_latents)
@@ -204,7 +206,7 @@ def capture_run(pipe, args):
 
 
 def official_run(pipe, cap, args):
-    """Phase B：官方 __call__ 以 capture 得到的 embeds/latents 重跑，返回最终 latents。"""
+    """Phase B: official __call__ re-run on the captured embeds/latents; returns final latents."""
     out = pipe(
         prompt_embeds=cap["prompt_embeds"].clone(),
         prompt_embeds_mask=cap["prompt_embeds_mask"].clone() if cap["prompt_embeds_mask"] is not None else None,
@@ -258,7 +260,7 @@ def save_artifacts(cap, official_latents, out_dir, pipe, args, load_s):
 
     same = torch.equal(cap["final_latents"], official_latents)
     max_diff = (cap["final_latents"] - official_latents).abs().max().item()
-    # 权重快照 sha（HF 下载后的 snapshot 目录名）
+    # Weight snapshot sha (the HF snapshot directory name)
     model_sha = "unknown"
     snap_root = os.path.join(os.environ.get("HF_HOME", ""), "hub", "models--briaai--Fibo-2.0-dev", "snapshots")
     if os.path.isdir(snap_root):
@@ -332,7 +334,7 @@ def save_artifacts(cap, official_latents, out_dir, pipe, args, load_s):
 
 
 def compare(a, b, name, report):
-    a, b = a.cpu(), b.cpu()  # safetensors 读回在 CPU，统一设备后再比对
+    a, b = a.cpu(), b.cpu()  # safetensors loads on CPU; align devices before comparing
     if a.shape != b.shape or a.dtype != b.dtype:
         report[name] = {"pass": False, "reason": f"shape/dtype mismatch {a.shape}/{a.dtype} vs {b.shape}/{b.dtype}"}
         return
@@ -348,12 +350,12 @@ def compare(a, b, name, report):
 
 
 def verify(args):
-    """Phase C：独立进程重跑 capture，与 run1 逐项比对。"""
+    """Phase C: re-run the capture in this independent process and compare with run1."""
     ref_dir = os.path.join(args.out, "run1")
     t0 = time.perf_counter()
     pipe = load_pipeline(args.model)
     load_s = time.perf_counter() - t0
-    with torch.no_grad():  # 与官方 @torch.no_grad() 行为一致
+    with torch.no_grad():  # match the official @torch.no_grad()
         cap = capture_run(pipe, args)
     report = {}
     tdir = os.path.join(ref_dir, "tensors")
@@ -434,8 +436,9 @@ def main():
     t0 = time.perf_counter()
     pipe = load_pipeline(args.model)
     load_s = time.perf_counter() - t0
-    # 官方 __call__ 带 @torch.no_grad()；手工复刻必须同样关闭 autograd，
-    # 否则 44 层中间激活 + attention 矩阵全部保留（~54GB），首个 forward 即 OOM
+    # The official __call__ is @torch.no_grad(); the manual replay must do
+    # the same, or the 44 blocks keep all activations + attention matrices
+    # (~54 GB) and the first forward OOMs
     with torch.no_grad():
         cap = capture_run(pipe, args)
     cap["stats"]["peak_after_load_gb"] = torch.cuda.max_memory_allocated() / 2**30
