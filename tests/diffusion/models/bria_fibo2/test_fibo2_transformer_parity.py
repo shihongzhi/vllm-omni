@@ -35,6 +35,14 @@ import pytest
 import torch
 from safetensors.torch import load_file, safe_open
 
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [
+    pytest.mark.local_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+]
+
 FIBO2_HF_HOME = Path(os.environ.get("FIBO2_HF_HOME", "/root/autodl-fs/fibo-baseline/hf-home"))
 FIBO2_REF_DATA = Path(os.environ.get("FIBO2_REF_DATA", "/root/autodl-fs/fibo-baseline/ref-data"))
 
@@ -139,7 +147,7 @@ def _first_inputs():
     pos = load_file(tdir / "prompt_embeds.safetensors")
     neg = load_file(tdir / "negative_prompt_embeds.safetensors")
     meta = json.loads((FIBO2_REF_DATA / "run1" / "meta.json").read_text())
-    # Basline scheduler timesteps are in "1000 * sigma" units; the transformer
+    # Baseline scheduler timesteps are in "1000 * sigma" units; the transformer
     # takes t in [0, 1].
     t0 = meta["timing_s"]["timesteps"][0] / 1000.0
     timestep = torch.full((1,), t0, dtype=torch.float32, device="cuda")
