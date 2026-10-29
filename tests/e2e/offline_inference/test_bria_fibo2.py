@@ -3,9 +3,11 @@
 """End-to-end tests for Bria Fibo-2.0 Dev / Edit Turbo through the full engine.
 
 Needs the gated checkpoints in the local HF cache (``HF_HOME`` pointing at the
-baseline cache works), so they run locally rather than in CI. When the parity
-baseline reference data is also available (``FIBO2_REF_DATA`` etc.), the
-decoded images are additionally compared against the baseline captures.
+baseline cache works), so they run locally rather than in CI. The edit tests
+always run against the committed source image
+(``tests/assets/bria_fibo2/edit_source.png``); when the parity baseline
+reference data is also available (``FIBO2_EDIT_REF`` etc.), the decoded images
+are additionally compared against the baseline captures.
 """
 
 import math
@@ -24,6 +26,14 @@ TURBO_MODEL = os.environ.get("FIBO2_TURBO_MODEL", "briaai/Fibo-2.0-edit-turbo")
 REF_DATA = os.environ.get("FIBO2_REF_DATA", "/root/autodl-fs/fibo-baseline/ref-data/run1")
 EDIT_REF = os.environ.get("FIBO2_EDIT_REF", "/root/autodl-fs/fibo-baseline/ref-data/edit1")
 TURBO_REF = os.environ.get("FIBO2_TURBO_REF", "/root/autodl-fs/fibo-baseline/ref-data/edit-turbo1")
+
+# The edit source committed with the repo: the baseline T2I capture the
+# diffusers edit baseline was run on, so the optional parity comparison below
+# sees exactly the input that baseline saw.
+EDIT_SOURCE = os.path.join(os.path.dirname(__file__), "../../assets/bria_fibo2/edit_source.png")
+# The edit baseline's instruction; used when the baseline reference data is
+# absent so the smoke run still exercises the real edit path.
+EDIT_INSTRUCTION = "Make the background a snowy forest"
 
 CAPTION = (
     '{"short_description":"A red bicycle leaning against a white brick wall on a sunny morning.",'
@@ -81,10 +91,10 @@ def test_bria_fibo2_t2i(offline_client: OfflineOmniClient):
 def _edit_e2e(offline_client, model, ref_dir, steps, guidance, label, min_cos):
     import json as _json
 
-    source = os.path.join(REF_DATA, "image.png")
     edited = os.path.join(ref_dir, "edited_image.png")
     meta_path = os.path.join(ref_dir, "meta.json")
     have_baseline = os.path.exists(edited) and os.path.exists(meta_path)
+    instruction = _json.load(open(meta_path))["stats"]["instruction"] if have_baseline else EDIT_INSTRUCTION
 
     sampling = OmniDiffusionSamplingParams(
         num_inference_steps=steps,
@@ -93,8 +103,8 @@ def _edit_e2e(offline_client, model, ref_dir, steps, guidance, label, min_cos):
     )
     request_config = {
         "model": model,
-        "prompt": CAPTION if not have_baseline else _json.load(open(meta_path))["stats"]["instruction"],
-        "images": [source],
+        "prompt": instruction,
+        "images": [EDIT_SOURCE],
         "sampling_params": sampling,
     }
     resp = offline_client.send_diffusion_request(request_config)
@@ -134,6 +144,30 @@ def test_bria_fibo2_edit_turbo(offline_client: OfflineOmniClient):
     """Edit Turbo: 4 steps, guidance 1.0 (no CFG, single forward per step),
     compared against the diffusers edit-turbo baseline."""
     _edit_e2e(offline_client, TURBO_MODEL, TURBO_REF, 4, 1.0, "turbo edit e2e vs baseline", 0.995)
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@pytest.mark.parametrize("omni_runner", [(TURBO_MODEL, None)], indirect=True)
+def test_bria_fibo2_turbo_defaults(offline_client: OfflineOmniClient):
+    """A turbo request omitting steps/guidance must get the documented turbo
+    defaults (4 steps, guidance 1: no CFG) from the official repo id, without
+    depending on the checkpoint's directory name. Wrong defaults (30 steps +
+    CFG) land far below the tolerance against the turbo baseline."""
+    sampling = OmniDiffusionSamplingParams(seed=42)
+    resp = offline_client.send_diffusion_request(
+        {"model": TURBO_MODEL, "prompt": EDIT_INSTRUCTION, "images": [EDIT_SOURCE], "sampling_params": sampling}
+    )
+    assert resp.success, f"request failed: {getattr(resp, 'error_message', None)}"
+    assert resp.images, f"no images in response: text={resp.text_content}"
+    got = np.asarray(resp.images[0], dtype=np.float32)
+    assert got.ndim == 3 and got.shape[2] == 3, f"bad image shape {got.shape}"
+
+    edited = os.path.join(TURBO_REF, "edited_image.png")
+    if not os.path.exists(edited):
+        pytest.skip("turbo baseline reference not available; e2e smoke only")
+    _compare_to_baseline(resp.images[0], edited, 0.99, "turbo defaults vs baseline")
 
 
 @pytest.mark.slow

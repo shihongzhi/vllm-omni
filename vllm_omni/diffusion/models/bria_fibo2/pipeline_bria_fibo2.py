@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.bria_fibo2.fibo2_transformer import (
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.utils.param_utils import unwrap_request_generator
 from vllm_omni.diffusion.worker.request_batch import (
     DiffusionRequestBatch,
     split_diffusion_output_by_request,
@@ -69,6 +70,55 @@ _DROP_CAPTION_KEYS = ("aesthetic_score", "preference_score")
 
 # Where an image stands in a Qwen3-VL prompt
 VISION_MARKER = "<|vision_start|><|image_pad|><|vision_end|>"
+
+# The Dev and Edit-Turbo checkpoints are structurally identical (same
+# transformer/scheduler/pipeline configs; only the weights are distilled), so
+# nothing in a local copy of either identifies the variant. The official
+# Edit-Turbo repo id is the one reliable name-based signal; checkpoints
+# hosted elsewhere must set their defaults via custom_pipeline_args.
+EDIT_TURBO_REPO_ID = "briaai/Fibo-2.0-edit-turbo"
+
+
+def _repo_id(model: str | None) -> str | None:
+    """Recover ``org/name`` from a model identifier.
+
+    The engine may resolve the configured model to its HF-cache snapshot path
+    before the pipeline sees it; the cache layout
+    (``.../hub/models--org--name/snapshots/<rev>``) is a fixed
+    huggingface_hub convention, so the repo id is recoverable from it —
+    unlike an arbitrary local directory name.
+    """
+
+    if not model:
+        return model
+    if "/models--" in model:
+        repo = model.split("/models--")[-1].split("/")[0]  # org--name
+        org, sep, name = repo.partition("--")
+        return f"{org}/{name}" if sep and name else model
+    return model
+
+
+def resolve_sampling_defaults(
+    model: str | None,
+    custom_pipeline_args: dict | None,
+) -> tuple[int, float]:
+    """The (num_inference_steps, guidance_scale) defaults for requests that
+    omit them.
+
+    diffusers ships 30 steps / guidance 5.0 for the shared pipeline class
+    (the Dev settings) and expects Edit-Turbo users to pass 4 / 1.0
+    explicitly. Mirroring that, the official turbo repo id (or its HF-cache
+    snapshot path) resolves to the documented turbo defaults, and
+    ``custom_pipeline_args`` overrides either field for checkpoints hosted
+    elsewhere (which carry no variant information at all).
+    """
+
+    steps, guidance = (4, 1.0) if _repo_id(model) == EDIT_TURBO_REPO_ID else (30, 5.0)
+    args = custom_pipeline_args or {}
+    steps = int(args.get("fibo2_default_num_inference_steps", steps))
+    guidance = float(args.get("fibo2_default_guidance_scale", guidance))
+    return steps, guidance
+
 
 # Training captions hold no empty values (None, "", {}, [] or NaN) and no
 # aesthetic_score / preference_score keys; the short_description +
@@ -423,14 +473,16 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         # the batch by the engine's request-batch key; request-local values
         # (seeds / generators / negative prompts) are read per request.
         sp = sps[0]
-        is_turbo = "turbo" in (self.od_config.model or "").lower()
-        num_inference_steps = sp.num_inference_steps or (4 if is_turbo else 30)
+        default_steps, default_guidance = resolve_sampling_defaults(
+            self.od_config.model, getattr(self.od_config, "custom_pipeline_args", None)
+        )
+        num_inference_steps = sp.num_inference_steps or default_steps
         # The engine coerces an unset guidance_scale to 1.0 in the request
         # layer, so `is not None` cannot tell "caller set it" apart; only a
         # provided value is honored, otherwise the model default applies
         # (Dev: 5.0 with CFG, Edit Turbo: 1.0 single-pass)
         guidance_provided = bool(getattr(sp, "guidance_scale_provided", False))
-        guidance_scale = sp.guidance_scale if guidance_provided else (1.0 if is_turbo else 5.0)
+        guidance_scale = sp.guidance_scale if guidance_provided else default_guidance
         output_type = sp.output_type or "pil"
         if sp.num_outputs_per_prompt and sp.num_outputs_per_prompt > 1:
             raise ValueError(
@@ -501,10 +553,14 @@ class BriaFibo2Pipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         # images to edit
         generators = []
         for sp_i in sps:
-            generator = sp_i.generator
+            # A request-scoped slot may arrive as a single-element list
+            # (OmniDiffusionSamplingParams.generator accepts both forms);
+            # randn_tensor's batch path would read generator[0].device on
+            # the nested list
+            generator = unwrap_request_generator(sp_i.generator, context="Fibo-2.0 request")
             if generator is None:
                 seed = getattr(sp_i, "seed", None)
-                generator = torch.Generator(device="cuda")
+                generator = torch.Generator(device=self._execution_device)
                 if seed is not None:
                     generator.manual_seed(seed)
             generators.append(generator)
