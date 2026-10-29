@@ -189,10 +189,7 @@ def get_bria_fibo2_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(request):
         prompt = request.prompt
-        has_image = (
-            not isinstance(prompt, str)
-            and (prompt.get("multi_modal_data") or {}).get("image") is not None
-        )
+        has_image = not isinstance(prompt, str) and (prompt.get("multi_modal_data") or {}).get("image") is not None
         if has_image:
             request.batch_compatibility_key = ("bria_fibo2", "edit", request.request_id)
         else:
