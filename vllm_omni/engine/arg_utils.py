@@ -13,6 +13,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
@@ -736,6 +737,9 @@ class OrchestratorArgs:
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
 
+    # === Output Processing ===
+    watermark_config: WatermarkConfig | None = None
+
     # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
     forced_aligner: str | None = None
     forced_aligner_config: str | None = None
@@ -757,6 +761,8 @@ class OrchestratorArgs:
     model_class_name: str | None = None
     hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: list[str] | None = None
     lora_backend: str | None = None
     lora_scale: float | None = None
@@ -799,6 +805,7 @@ class OrchestratorArgs:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
